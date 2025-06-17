@@ -869,11 +869,10 @@ LRESULT CALLBACK win32_fake_window_proc(HWND hwnd, UINT uMsg, WPARAM wParam, LPA
 	return DefWindowProcA(hwnd, uMsg, wParam, lParam);
 }
 
-static LRESULT CALLBACK win32_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+static void win32_handle_raw_input(HRAWINPUT raw_input);
+static void win32_handle_device_change(HANDLE hDevice, DWORD dwChange);
 
-    // TODO: maybe put these in the window message handler that we have made?
-	int width = LOWORD(lparam);
-	int height = HIWORD(lparam);
+static LRESULT CALLBACK win32_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
     switch (msg) {
         case WM_CLOSE:
@@ -882,62 +881,15 @@ static LRESULT CALLBACK win32_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LP
         case WM_DESTROY:
             PostQuitMessage(0); // Posts WM_QUIT to the message queue
             return 0;
+        case WM_INPUT:
+            win32_handle_raw_input((HRAWINPUT)lparam);
+            return 0;
+            
+        case WM_INPUT_DEVICE_CHANGE:
+            win32_handle_device_change((HANDLE)lparam, (DWORD)wparam);
+            return 0;
     }
-
-    if (msg == WM_INPUT) {
-        HRAWINPUT raw_input = (HRAWINPUT)lparam;
-        UINT size = 0;
-        GetRawInputData(raw_input, RID_INPUT, NULL, &size, sizeof(RAWINPUTHEADER));
-        
-        RAWINPUT* raw = (RAWINPUT*)malloc(size);
-        if (GetRawInputData(raw_input, RID_INPUT, raw, &size, sizeof(RAWINPUTHEADER)) > 0) {
-            for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
-                if (win32_gamepad_ctx.win32_raw_devices[i].handle == raw->header.hDevice) {
-                    PHIDP_PREPARSED_DATA pp_data = win32_gamepad_ctx.win32_raw_devices[i].pp_data;
-                    PCHAR report = (PCHAR)raw->data.hid.bRawData;
-                    USHORT report_length = raw->data.hid.dwSizeHid;
-
-                    // Process buttons
-                    USAGE buttons[PAL_MAX_BUTTONS];
-                    ULONG button_length = win32_gamepad_ctx.win32_raw_devices[i].button_count;
-                    if (HidP_GetUsages(HidP_Input, HID_USAGE_PAGE_BUTTON, 0, buttons, &button_length, 
-                                      pp_data, report, report_length) == HIDP_STATUS_SUCCESS) {
-                        // Reset all buttons
-                        for (int j = 0; j < win32_gamepad_ctx.win32_raw_devices[i].button_count; j++) {
-                            win32_gamepad_ctx.win32_raw_devices[i].buttons[j].value = 0.0f;
-                        }
-                        // Set pressed buttons
-                        for (ULONG j = 0; j < button_length; j++) {
-                            if (buttons[j] <= win32_gamepad_ctx.win32_raw_devices[i].button_count) {
-                                win32_gamepad_ctx.win32_raw_devices[i].buttons[buttons[j]-1].value = 1.0f;
-                            }
-                        }
-                    }
-
-                    // Process axes
-                    for (int j = 0; j < win32_gamepad_ctx.win32_raw_devices[i].axis_count; j++) {
-                        ULONG value;
-                        if (HidP_GetUsageValue(HidP_Input, 
-                                              win32_gamepad_ctx.win32_raw_devices[i].axes[j].usage >> 8,
-                                              0, 
-                                              win32_gamepad_ctx.win32_raw_devices[i].axes[j].usage & 0xFF,
-                                              &value, 
-                                              pp_data, 
-                                              report, 
-                                              report_length) == HIDP_STATUS_SUCCESS) {
-                            float normalized = (2.0f * (value - win32_gamepad_ctx.win32_raw_devices[i].axes[j].min) / 
-                                             (win32_gamepad_ctx.win32_raw_devices[i].axes[j].max - win32_gamepad_ctx.win32_raw_devices[i].axes[j].min)) - 1.0f;
-                            win32_gamepad_ctx.win32_raw_devices[i].axes[j].value = 
-                                win32_gamepad_ctx.win32_raw_devices[i].axes[j].inverted ? -normalized : normalized;
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-        free(raw);
-    }
-    return DefWindowProc(hwnd, msg, wparam, lparam);
+      return DefWindowProc(hwnd, msg, wparam, lparam);
 }
 
 // Window Hints
