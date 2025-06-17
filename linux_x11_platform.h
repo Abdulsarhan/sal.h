@@ -18,6 +18,9 @@
 #include <GL/gl.h>
 #include <GL/glx.h>
 
+// time
+#include <time.h>
+#include <errno.h>
 // dlopen/dlsym/dlclose
 #include <dlfcn.h>
 
@@ -127,4 +130,11 @@ uint8_t platform_free_dynamic_library(void* so_handle) {
 	return (uint8_t)(result == 0);
 }
 
+void platform_sleep(double milliseconds) {
+    struct timespec ts;
+    ts.tv_sec = (time_t)(milliseconds / 1000);
+    ts.tv_nsec = (long)((milliseconds - (ts.tv_sec * 1000)) * 1000000);
+    
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR);
+}
 #endif // LINUX_X11_PLATFORM_H

@@ -71,11 +71,21 @@ int main() {
 
 	play_sound(&sound, 0.1);
 
-    pal_set_window_icon_legacy(window, "C:\\Users\\abdul.DESKTOP-S9KEIDK\\Desktop\\sal-rewrite\\Project1\\Project1\\icon.ico");
+    pal_set_window_icon_legacy(window, "icon.ico");
     pal_set_taskbar_icon(window, "C:\\Users\\abdul.DESKTOP-S9KEIDK\\Desktop\\sal-rewrite\\Project1\\Project1\\png.png");
     pal_set_cursor(window, "C:\\Users\\abdul.DESKTOP-S9KEIDK\\Desktop\\sal-rewrite\\Project1\\Project1\\png.png", 16);
     uint8_t running = 1;
     pal_event event;
+
+    // 1. Initialize library
+    // TODO: These are in win32_platform_h. Make platform functions for these.
+    pal_gamepad_init();
+    
+    // 2. Load controller mappings (optional but recommended)
+    if (!pal_gamepad_load_mappings("controller_mappings.txt")) {
+        printf("Warning: Could not load controller mappings\n");
+    }
+
     while (running) {
 		while (pal_poll_events(&event, window))
 		{
@@ -124,10 +134,33 @@ int main() {
 		}
 
 */
+        pal_gamepad_state state;
+        
+        // 5. Check all connected controllers
+        for (int i = 0; i < pal_gamepad_get_count(); i++) {
+            if (pal_gamepad_get_state(i, &state)) {
+                printf("\nController %d: %s\n", i, state.name);
+                printf("  Left Stick: %.2f, %.2f\n", state.axes.left_x, state.axes.left_y);
+                printf("  Right Stick: %.2f, %.2f\n", state.axes.right_x, state.axes.right_y);
+                printf("  Triggers: L=%.2f R=%.2f\n", state.axes.left_trigger, state.axes.right_trigger);
+                printf("  Buttons: A=%d B=%d X=%d Y=%d\n", 
+                      state.buttons.a, state.buttons.b, 
+                      state.buttons.x, state.buttons.y);
+
+                // 6. Example vibration (Xbox controllers only)
+                if (state.buttons.a && state.is_xinput) {
+                    pal_gamepad_set_vibration(i, 0.5f, 0.5f);  // 50% power
+                } else {
+                    pal_gamepad_set_vibration(i, 0.0f, 0.0f);  // Stop vibration
+                }
+            }
+        }
+
 		begin_drawing();
 		glClearColor(0.2f, 0.2f, 0.2f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		end_drawing(window);
+        pal_sleep(16);
     }
 
     return 0;

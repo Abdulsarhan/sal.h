@@ -21,6 +21,28 @@ typedef struct {
 
 }Sound;
 
+typedef struct {
+    struct {
+        float left_x, left_y;
+        float right_x, right_y;
+        float left_trigger, right_trigger;
+    } axes;
+    
+    struct {
+        pal_bool a, b, x, y;
+        pal_bool back, start, guide;
+        pal_bool left_stick, right_stick;
+        pal_bool left_shoulder, right_shoulder;
+        pal_bool dpad_up, dpad_down, dpad_left, dpad_right;
+    } buttons;
+    
+    char name[128];
+    uint16_t vendor_id;
+    uint16_t product_id;
+    pal_bool connected;
+    pal_bool is_xinput;
+} pal_gamepad_state;
+
 // Window stuff.
 typedef struct pal_window pal_window;
 typedef struct pal_monitor pal_monitor;
@@ -681,15 +703,12 @@ PALAPI void set_mouse_processed(int button);
 PALAPI v2 get_mouse_position(pal_window* window);
 
 // Gamepad Input
-PALAPI int is_button_down(int controller_id, unsigned short button);
-PALAPI int is_button_pressed(int controller_id, unsigned short button);
-PALAPI int is_button_released(int controller_id, unsigned short button);
-PALAPI v2 get_right_stick(int controller_id);
-PALAPI v2 get_left_stick(int controller_id);
-PALAPI float get_right_trigger(int controller_id);
-PALAPI float get_left_trigger(int controller_id);
-PALAPI void set_controller_vibration(int controller_id, float left_motor, float right_motor);
-PALAPI void stop_controller_vibration(int controller_id);
+PALAPI void pal_gamepad_init();
+void pal_gamepad_shutdown();
+int pal_gamepad_get_count();
+pal_bool pal_gamepad_get_state(int index, pal_gamepad_state* out_state);
+pal_bool pal_gamepad_set_vibration(int index, float left_motor, float right_motor);
+pal_bool pal_gamepad_load_mappings(const char* filename);
 
 PALAPI void begin_drawing(void);
 PALAPI void DrawTriangle(void);
@@ -699,6 +718,7 @@ PALAPI void end_drawing(pal_window* window);
 PALAPI int load_sound(const char* filename, Sound* out);
 PALAPI int play_sound(Sound* sound, float volume);
 
+// File I/O.
 PALAPI uint8_t does_file_exist(const char* file_path);
 PALAPI time_t get_file_timestamp(const char* file);
 PALAPI long get_file_size(const char* file_path);
@@ -706,6 +726,7 @@ PALAPI char* read_file(const char* filePath, int* fileSize, char* buffer);
 PALAPI void write_file(const char* filePath, char* buffer, int size);
 PALAPI uint8_t copy_file(const char* fileName, const char* outputName, char* buffer);
 
+// String parsing functions.
 PALAPI uint8_t is_upper_case(char ch);
 PALAPI uint8_t is_lower_case(char ch);
 PALAPI uint8_t is_letter(char ch);
@@ -718,10 +739,14 @@ PALAPI uint8_t is_dot(char ch);
 PALAPI uint8_t are_chars_equal(char ch1, char ch2);
 PALAPI uint8_t are_strings_equal(int count, char* str1, char* str2);
 
+// Dynamic library functions
 void* load_dynamic_library(char* dll);
 void* load_dynamic_function(void* dll, char* func_name);
 uint8_t free_dynamic_library(void* dll);
 
+// Timers
+
+void pal_sleep(double milliseconds);
 
 #ifdef __cplusplus
 }
