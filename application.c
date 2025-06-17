@@ -79,7 +79,7 @@ int main() {
 
     // 1. Initialize library
     // TODO: These are in win32_platform_h. Make platform functions for these.
-    pal_gamepad_init();
+    pal_gamepad_init(window);
     
     // 2. Load controller mappings (optional but recommended)
     if (!pal_gamepad_load_mappings("controller_mappings.txt")) {

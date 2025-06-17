@@ -151,8 +151,8 @@ PALAPI int make_context_current(pal_window* window) {
 	return platform_make_context_current(window);
 }
 
-PALAPI void pal_gamepad_init() {
-	(void)platform_gamepad_init();
+PALAPI void pal_gamepad_init(pal_window* window) {
+	(void)platform_gamepad_init(window);
 }
 void pal_gamepad_shutdown() {
 	(void)platform_gamepad_shutdown();
@@ -569,6 +569,6 @@ PALAPI uint8_t are_strings_equal(int count, char* str1, char* str2) {
 	return 1;
 }
 
-void pal_sleep(double milliseconds) {
-	platform_sleep(milliseconds);
+int pal_sleep(double milliseconds) {
+	return platform_sleep(milliseconds);
 }

@@ -21,7 +21,9 @@ typedef struct {
 
 }Sound;
 
+#define PAL_MAX_TOUCHES 2
 typedef struct {
+    // Standard gamepad controls
     struct {
         float left_x, left_y;
         float right_x, right_y;
@@ -34,13 +36,33 @@ typedef struct {
         pal_bool left_stick, right_stick;
         pal_bool left_shoulder, right_shoulder;
         pal_bool dpad_up, dpad_down, dpad_left, dpad_right;
+        pal_bool touchpad_button;
     } buttons;
     
+    // Identification
     char name[128];
     uint16_t vendor_id;
     uint16_t product_id;
     pal_bool connected;
     pal_bool is_xinput;
+
+    // Battery information
+    float battery_level;        // 0.0-1.0
+    pal_bool is_charging;
+
+    // Motion sensors
+    float accel_x, accel_y, accel_z;  // In G's
+    float gyro_x, gyro_y, gyro_z;     // In degrees/second
+
+    // Touchpad
+    struct {
+        int touch_count;
+        struct {
+            int id;            // Touch ID
+            float x, y;        // Normalized coordinates (0-1)
+            pal_bool down;     // Is touch active
+        } touches[PAL_MAX_TOUCHES];
+    } touchpad;
 } pal_gamepad_state;
 
 // Window stuff.
@@ -703,7 +725,7 @@ PALAPI void set_mouse_processed(int button);
 PALAPI v2 get_mouse_position(pal_window* window);
 
 // Gamepad Input
-PALAPI void pal_gamepad_init();
+PALAPI void pal_gamepad_init(pal_window* window);
 void pal_gamepad_shutdown();
 int pal_gamepad_get_count();
 pal_bool pal_gamepad_get_state(int index, pal_gamepad_state* out_state);
@@ -746,7 +768,7 @@ uint8_t free_dynamic_library(void* dll);
 
 // Timers
 
-void pal_sleep(double milliseconds);
+int pal_sleep(double milliseconds);
 
 #ifdef __cplusplus
 }
