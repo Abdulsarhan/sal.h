@@ -114,18 +114,13 @@ typedef struct {
 
 typedef struct {
     uint8_t report[64];
+    uint8_t report_size;   
     pal_bool has_report;
     OVERLAPPED overlapped;
 } win32_dualsense_state;
 
 // Global State
-static struct {
-#if PAL_XINPUT_ENABLED
-    pal_bool win32_xinput_connected[4];
-    XINPUT_STATE win32_xinput_states[4];
-#endif
-
-    struct {
+typedef struct hid_device{
         HANDLE handle;
         PHIDP_PREPARSED_DATA pp_data;
         uint16_t vendor_id;
@@ -136,19 +131,31 @@ static struct {
         win32_gamepad_axis axes[PAL_MAX_AXES];
         uint8_t axis_count;
         pal_bool connected;
-    } win32_raw_devices[PAL_MAX_GAMEPADS];
 
-    struct {
+}hid_device;
+
+struct {
+#if PAL_XINPUT_ENABLED
+    pal_bool xinput_connected[4];
+    XINPUT_STATE xinput_states[4];
+#endif
+
+    uint8_t raw_input_buffer[1024];  // <-- THIS IS THE BUFFER
+
+    struct hid_device hid_devices[PAL_MAX_GAMEPADS];
+    struct { // DualSense/DS4
         HANDLE handle;
         win32_dualsense_state state;
+        uint16_t vendor_id;
+        uint16_t product_id;
+        char name[128];
         pal_bool connected;
-    } win32_dualsense_devices[PAL_MAX_GAMEPADS];
+    } ds_devices[PAL_MAX_GAMEPADS];
 
-    win32_gamepad_mapping win32_mappings[PAL_MAX_MAPPINGS];
-    int win32_mapping_count;
-    pal_bool win32_initialized;
-    HWND win32_hwnd;
-    uint8_t raw_input_buffer[1024];
+    win32_gamepad_mapping mappings[PAL_MAX_MAPPINGS];
+    int mapping_count;
+    pal_bool initialized;
+    HWND hwnd;
 } win32_gamepad_ctx;
 
 #pragma pack(push, 1)
@@ -1547,7 +1554,7 @@ uint8_t platform_free_dynamic_library(void* dll) {
 
 
 // Called from Public API
-void platform_gamepad_init(HWND window);
+void platform_gamepad_init(pal_window* window);
 void platform_gamepad_shutdown();
 int platform_gamepad_get_count();
 pal_bool platform_gamepad_get_state(int index, pal_gamepad_state* out_state);
@@ -1561,12 +1568,17 @@ pal_bool platform_gamepad_load_mappings(const char* filename);
 // Internal Types
 
 // DualSense constants
-#define DUALSHOCK_VENDOR_ID  0x054C
-#define DUALSHOCK_PRODUCT_ID 0x0CE6
-#define DS_INPUT_REPORT_ID 0x01
-#define DS_OUTPUT_REPORT_ID 0x31
-#define DS_FEATURE_REPORT_ID 0x05
 
+#define DUALSHOCK_VENDOR_ID   0x054C
+#define DUALSHOCK_PRODUCT_ID  0x0CE6
+#define DS4_V1_PRODUCT_ID     0x05C4
+#define DS4_V2_PRODUCT_ID     0x09CC
+#define DS_INPUT_REPORT_ID    0x01
+#define DS_OUTPUT_REPORT_ID   0x31
+#define DS_FEATURE_REPORT_ID  0x05
+#define DS_BT_REPORT_ID       0x31
+
+// Button masks
 #define DS_BUTTON_MASK_SQUARE     0x10
 #define DS_BUTTON_MASK_CROSS      0x20
 #define DS_BUTTON_MASK_CIRCLE     0x40
@@ -1592,50 +1604,315 @@ static pal_bool win32_is_dualsense(uint16_t vid, uint16_t pid) {
 }
 
 static void win32_start_dualsense_async_read(int index) {
-    if (!win32_gamepad_ctx.win32_dualsense_devices[index].connected) return;
+    if (!win32_gamepad_ctx.ds_devices[index].connected) return;
 
-    HANDLE hDevice = win32_gamepad_ctx.win32_dualsense_devices[index].handle;
-    win32_dualsense_state* state = &win32_gamepad_ctx.win32_dualsense_devices[index].state;
+    HANDLE hDevice = win32_gamepad_ctx.ds_devices[index].handle;
+    win32_dualsense_state* state = &win32_gamepad_ctx.ds_devices[index].state;
     
     memset(state->report, 0, sizeof(state->report));
     ResetEvent(state->overlapped.hEvent);
     
     if (!ReadFile(hDevice, state->report, sizeof(state->report), NULL, &state->overlapped)) {
         if (GetLastError() != ERROR_IO_PENDING) {
-            win32_gamepad_ctx.win32_dualsense_devices[index].connected = FALSE;
+            win32_gamepad_ctx.ds_devices[index].connected = FALSE;
             CloseHandle(hDevice);
             CloseHandle(state->overlapped.hEvent);
         }
     }
 }
 
-static void win32_update_dualsense(int index) {
-    if (!win32_gamepad_ctx.win32_dualsense_devices[index].connected) return;
+static void win32_init_hid_device_buttons(struct hid_device* device, PHIDP_PREPARSED_DATA pp_data, HIDP_CAPS* caps) {
+    device->button_count = 0;
+    
+    // Get button capabilities
+    USHORT button_caps_length = caps->NumberInputButtonCaps;
+    HIDP_BUTTON_CAPS* button_caps = (HIDP_BUTTON_CAPS*)malloc(button_caps_length * sizeof(HIDP_BUTTON_CAPS));
+    if (!button_caps) return;
+    
+    if (HidP_GetButtonCaps(HidP_Input, button_caps, &button_caps_length, pp_data) == HIDP_STATUS_SUCCESS) {
+        for (USHORT i = 0; i < button_caps_length && device->button_count < PAL_MAX_BUTTONS; i++) {
+            if (button_caps[i].IsRange) {
+                USHORT usage_min = button_caps[i].Range.UsageMin;
+                USHORT usage_max = button_caps[i].Range.UsageMax;
+                for (USHORT usage = usage_min; usage <= usage_max && device->button_count < PAL_MAX_BUTTONS; usage++) {
+                    device->buttons[device->button_count++].usage = usage;
+                }
+            } else {
+                device->buttons[device->button_count++].usage = button_caps[i].NotRange.Usage;
+            }
+        }
+    }
+    
+    free(button_caps);
+}
 
-    win32_dualsense_state* state = &win32_gamepad_ctx.win32_dualsense_devices[index].state;
+// Initialize HID device axes
+static void win32_init_hid_device_axes(struct hid_device* device, PHIDP_PREPARSED_DATA pp_data, HIDP_CAPS* caps) {
+    device->axis_count = 0;
+    
+    // Get value capabilities
+    USHORT value_caps_length = caps->NumberInputValueCaps;
+    HIDP_VALUE_CAPS* value_caps = (HIDP_VALUE_CAPS*)malloc(value_caps_length * sizeof(HIDP_VALUE_CAPS));
+    if (!value_caps) return;
+    
+    if (HidP_GetValueCaps(HidP_Input, value_caps, &value_caps_length, pp_data) == HIDP_STATUS_SUCCESS) {
+        for (USHORT i = 0; i < value_caps_length && device->axis_count < PAL_MAX_AXES; i++) {
+            if (value_caps[i].UsagePage == 1) { // Generic Desktop Page
+                device->axes[device->axis_count].usage = value_caps[i].IsRange ? 
+                    value_caps[i].Range.UsageMin : value_caps[i].NotRange.Usage;
+                device->axes[device->axis_count].min = value_caps[i].LogicalMin;
+                device->axes[device->axis_count].max = value_caps[i].LogicalMax;
+                device->axis_count++;
+            }
+        }
+    }
+    
+    free(value_caps);
+}
+
+// Update HID device state
+static void win32_update_hid_device(int index) {
+    if (index < 0 || index >= PAL_MAX_GAMEPADS || !win32_gamepad_ctx.hid_devices[index].connected) {
+        return;
+    }
+    
+    struct hid_device* device = &win32_gamepad_ctx.hid_devices[index];
+    PHIDP_PREPARSED_DATA pp_data = device->pp_data;
+    
+    // Read input report
+    uint8_t report[64] = {0};
+    DWORD bytesRead;
+    if (!ReadFile(device->handle, report, sizeof(report), &bytesRead, NULL)) {
+        return;
+    }
+    
+    // Update buttons
+    for (int i = 0; i < device->button_count; i++) {
+        USAGE usage = device->buttons[i].usage;
+        ULONG usage_value = 0;
+        if (HidP_GetUsageValue(HidP_Input, 0x09, 0, usage, &usage_value, pp_data, report, bytesRead) == HIDP_STATUS_SUCCESS) {
+            device->buttons[i].value = (float)usage_value;
+        }
+    }
+    
+    // Update axes
+    for (int i = 0; i < device->axis_count; i++) {
+        USAGE usage = device->axes[i].usage;
+        ULONG value = 0;
+        if (HidP_GetUsageValue(HidP_Input, 0x01, 0, usage, &value, pp_data, report, bytesRead) == HIDP_STATUS_SUCCESS) {
+            // Normalize to [-1,1] range
+            float normalized = (float)(value - device->axes[i].min) / 
+                             (float)(device->axes[i].max - device->axes[i].min) * 2.0f - 1.0f;
+            device->axes[i].value = normalized;
+        }
+    }
+}
+
+// Handle DualSense connection
+static void win32_handle_ds_connection(HANDLE hDevice) {
+    UINT path_length = 0;
+    if (GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, NULL, &path_length) == (UINT)-1) {
+        return;
+    }
+
+    char* device_path = (char*)malloc(path_length);
+    if (!device_path) return;
+
+    if (GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, device_path, &path_length) == (UINT)-1) {
+        free(device_path);
+        return;
+    }
+
+    // Find empty slot
+    for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
+        if (!win32_gamepad_ctx.ds_devices[i].connected) {
+            HANDLE hDualSense = CreateFileA(
+                device_path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                NULL);
+
+            if (hDualSense != INVALID_HANDLE_VALUE) {
+                // Get device info
+                RID_DEVICE_INFO info = {0};
+                info.cbSize = sizeof(info);
+                UINT info_size = sizeof(info);
+                GetRawInputDeviceInfo(hDevice, RIDI_DEVICEINFO, &info, &info_size);
+
+                // Initialize device
+                win32_gamepad_ctx.ds_devices[i].handle = hDualSense;
+                win32_gamepad_ctx.ds_devices[i].vendor_id = info.hid.dwVendorId;
+                win32_gamepad_ctx.ds_devices[i].product_id = info.hid.dwProductId;
+                
+                // Get device name
+                wchar_t wname[128] = {0};
+                if (HidD_GetProductString(hDualSense, wname, sizeof(wname))) {
+                    WideCharToMultiByte(CP_UTF8, 0, wname, -1, 
+                                       win32_gamepad_ctx.ds_devices[i].name, 
+                                       sizeof(win32_gamepad_ctx.ds_devices[i].name), 
+                                       NULL, NULL);
+                } else {
+                    strncpy(win32_gamepad_ctx.ds_devices[i].name, "DualSense Controller",
+                           sizeof(win32_gamepad_ctx.ds_devices[i].name) - 1);
+                }
+
+                // Initialize overlapped I/O
+                memset(&win32_gamepad_ctx.ds_devices[i].state, 0, sizeof(win32_dualsense_state));
+                win32_gamepad_ctx.ds_devices[i].state.overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+                win32_gamepad_ctx.ds_devices[i].connected = TRUE;
+                
+                // Start async read
+                win32_start_dualsense_async_read(i);
+                break;
+            }
+        }
+    }
+
+    free(device_path);
+}
+
+// Update DualSense state
+static void win32_update_ds_state(int index) {
+    if (index < 0 || index >= PAL_MAX_GAMEPADS || !win32_gamepad_ctx.ds_devices[index].connected) {
+        return;
+    }
+
+    win32_dualsense_state* state = &win32_gamepad_ctx.ds_devices[index].state;
     
     DWORD bytesRead;
-    if (GetOverlappedResult(win32_gamepad_ctx.win32_dualsense_devices[index].handle, 
+    if (GetOverlappedResult(win32_gamepad_ctx.ds_devices[index].handle, 
+                          &state->overlapped, &bytesRead, FALSE)) {
+        if (bytesRead > 0) {
+            state->has_report = TRUE;
+            state->report_size = bytesRead;
+            win32_start_dualsense_async_read(index);
+        }
+    } else if (GetLastError() != ERROR_IO_INCOMPLETE) {
+        win32_gamepad_ctx.ds_devices[index].connected = FALSE;
+        CloseHandle(win32_gamepad_ctx.ds_devices[index].handle);
+        CloseHandle(state->overlapped.hEvent);
+    }
+}
+
+// Set vibration for all supported controllers
+pal_bool platform_gamepad_set_vibration(int index, float left_motor, float right_motor) {
+    // Clamp values
+    left_motor = fmaxf(0.0f, fminf(1.0f, left_motor));
+    right_motor = fmaxf(0.0f, fminf(1.0f, right_motor));
+
+    // 1. XInput controllers
+#if PAL_XINPUT_ENABLED
+    if (index < 4) {
+        XINPUT_VIBRATION vibration = {
+            .wLeftMotorSpeed = (WORD)(left_motor * 65535.0f),
+            .wRightMotorSpeed = (WORD)(right_motor * 65535.0f)
+        };
+        return XInputSetState(index, &vibration) == ERROR_SUCCESS;
+    }
+    index -= 4;
+#endif
+
+    // 2. DualSense/DS4 controllers
+    if (index >= 0 && index < PAL_MAX_GAMEPADS && 
+        win32_gamepad_ctx.ds_devices[index].connected) {
+        uint8_t report[48] = {0};
+        report[0] = DS_OUTPUT_REPORT_ID;
+        report[1] = 0xFF; // Flags
+        
+        // Motor values (0-255)
+        report[3] = (uint8_t)(right_motor * 255.0f);
+        report[4] = (uint8_t)(left_motor * 255.0f);
+        
+        DWORD bytesWritten;
+        return WriteFile(win32_gamepad_ctx.ds_devices[index].handle, 
+                        report, sizeof(report), &bytesWritten, NULL);
+    }
+
+    // 3. Generic HID devices
+    if (index >= 0 && index < PAL_MAX_GAMEPADS && 
+        win32_gamepad_ctx.hid_devices[index].connected) {
+        // Try to find rumble feature report
+        uint8_t report[64] = {0};
+        
+        // Common HID rumble pattern (may need adjustment per device)
+        report[0] = 0x03; // Feature report ID (common for rumble)
+        report[1] = (uint8_t)(left_motor * 255.0f);
+        report[2] = (uint8_t)(right_motor * 255.0f);
+        
+        return HidD_SetFeature(win32_gamepad_ctx.hid_devices[index].handle, report, sizeof(report));
+    }
+
+    return FALSE;
+}
+
+// Set LED color (for supported controllers)
+pal_bool platform_gamepad_set_led(int index, uint8_t r, uint8_t g, uint8_t b) {
+    // 1. DualSense/DS4 controllers
+    if (index >= 0 && index < PAL_MAX_GAMEPADS && 
+        win32_gamepad_ctx.ds_devices[index].connected) {
+        uint8_t report[48] = {0};
+        report[0] = DS_OUTPUT_REPORT_ID;
+        report[1] = 0xFF; // Flags
+        
+        // LED color (offset may vary between DS4 and DualSense)
+        report[44] = r;
+        report[45] = g;
+        report[46] = b;
+        
+        DWORD bytesWritten;
+        return WriteFile(win32_gamepad_ctx.ds_devices[index].handle, 
+                        report, sizeof(report), &bytesWritten, NULL);
+    }
+
+    // 2. Generic HID devices
+    if (index >= 0 && index < PAL_MAX_GAMEPADS && 
+        win32_gamepad_ctx.hid_devices[index].connected) {
+        // Try to find LED feature report
+        uint8_t report[64] = {0};
+        
+        // Common HID LED pattern (may need adjustment per device)
+        report[0] = 0x05; // Feature report ID (common for LED)
+        report[1] = r;
+        report[2] = g;
+        report[3] = b;
+        
+        return HidD_SetFeature(win32_gamepad_ctx.hid_devices[index].handle, report, sizeof(report));
+    }
+
+    return FALSE;
+}
+
+// Load gamepad mappings from file
+static void win32_update_dualsense(int index) {
+    if (!win32_gamepad_ctx.ds_devices[index].connected) return;
+
+    win32_dualsense_state* state = &win32_gamepad_ctx.ds_devices[index].state;
+    
+    DWORD bytesRead;
+    if (GetOverlappedResult(win32_gamepad_ctx.ds_devices[index].handle, 
                           &state->overlapped, &bytesRead, FALSE)) {
         if (bytesRead > 0 && state->report[0] == DS_INPUT_REPORT_ID) {
             state->has_report = TRUE;
             win32_start_dualsense_async_read(index);
         }
     } else if (GetLastError() != ERROR_IO_INCOMPLETE) {
-        win32_gamepad_ctx.win32_dualsense_devices[index].connected = FALSE;
-        CloseHandle(win32_gamepad_ctx.win32_dualsense_devices[index].handle);
+        win32_gamepad_ctx.ds_devices[index].connected = FALSE;
+        CloseHandle(win32_gamepad_ctx.ds_devices[index].handle);
         CloseHandle(state->overlapped.hEvent);
     }
 }
 
 static void win32_dualsense_to_unified(int index, pal_gamepad_state* out) {
     if (!out || index < 0 || index >= PAL_MAX_GAMEPADS || 
-        !win32_gamepad_ctx.win32_dualsense_devices[index].connected ||
-        !win32_gamepad_ctx.win32_dualsense_devices[index].state.has_report) {
+        !win32_gamepad_ctx.ds_devices[index].connected ||
+        !win32_gamepad_ctx.ds_devices[index].state.has_report) {
         return;
     }
 
-    uint8_t* report = win32_gamepad_ctx.win32_dualsense_devices[index].state.report;
+    uint8_t* report = win32_gamepad_ctx.ds_devices[index].state.report;
 
     // Buttons
     out->buttons.a = (report[7] & DS_BUTTON_MASK_CROSS) != 0;
@@ -1703,11 +1980,11 @@ static void win32_dualsense_to_unified(int index, pal_gamepad_state* out) {
 
 static pal_bool win32_dualsense_set_vibration(int index, float left_motor, float right_motor) {
     if (index < 0 || index >= PAL_MAX_GAMEPADS || 
-        !win32_gamepad_ctx.win32_dualsense_devices[index].connected) {
+        !win32_gamepad_ctx.ds_devices[index].connected) {
         return FALSE;
     }
 
-    HANDLE handle = win32_gamepad_ctx.win32_dualsense_devices[index].handle;
+    HANDLE handle = win32_gamepad_ctx.ds_devices[index].handle;
     
     uint8_t output_report[48] = {0};
     output_report[0] = DS_OUTPUT_REPORT_ID;
@@ -1735,7 +2012,7 @@ static void win32_handle_dualsense_connection(HANDLE hDevice) {
     }
 
     for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
-        if (!win32_gamepad_ctx.win32_dualsense_devices[i].connected) {
+        if (!win32_gamepad_ctx.ds_devices[i].connected) {
             HANDLE hDualSense = CreateFileA(
                 device_path,
                 GENERIC_READ | GENERIC_WRITE,
@@ -1746,12 +2023,12 @@ static void win32_handle_dualsense_connection(HANDLE hDevice) {
                 NULL);
 
             if (hDualSense != INVALID_HANDLE_VALUE) {
-                win32_gamepad_ctx.win32_dualsense_devices[i].handle = hDualSense;
-                win32_gamepad_ctx.win32_dualsense_devices[i].connected = TRUE;
-                memset(&win32_gamepad_ctx.win32_dualsense_devices[i].state, 0,
+                win32_gamepad_ctx.ds_devices[i].handle = hDualSense;
+                win32_gamepad_ctx.ds_devices[i].connected = TRUE;
+                memset(&win32_gamepad_ctx.ds_devices[i].state, 0,
                       sizeof(win32_dualsense_state));
                 
-                win32_gamepad_ctx.win32_dualsense_devices[i].state.overlapped.hEvent = 
+                win32_gamepad_ctx.ds_devices[i].state.overlapped.hEvent = 
                     CreateEvent(NULL, TRUE, FALSE, NULL);
                 
                 win32_start_dualsense_async_read(i);
@@ -1762,77 +2039,107 @@ static void win32_handle_dualsense_connection(HANDLE hDevice) {
 
     free(device_path);
 }
-
 static void win32_handle_raw_input(HRAWINPUT raw_input) {
-    uint8_t stack_buffer[256];
-    RAWINPUT* raw = (RAWINPUT*)stack_buffer;
-    UINT size = sizeof(stack_buffer);
+    RAWINPUT* raw = (RAWINPUT*)win32_gamepad_ctx.raw_input_buffer;
+    UINT size = sizeof(win32_gamepad_ctx.raw_input_buffer);
     UINT result;
 
-    result = GetRawInputData(raw_input, RID_INPUT, stack_buffer, &size, sizeof(RAWINPUTHEADER));
-    
-    if (result == (UINT)-1 && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
-        if (size <= sizeof(win32_gamepad_ctx.raw_input_buffer)) {
-            raw = (RAWINPUT*)win32_gamepad_ctx.raw_input_buffer;
-            result = GetRawInputData(raw_input, RID_INPUT, raw, &size, sizeof(RAWINPUTHEADER));
-            if (result == (UINT)-1) return;
-        } else {
-            return;
-        }
-    } else if (result == (UINT)-1) {
+    // Get raw input data
+    result = GetRawInputData(raw_input, RID_INPUT, raw, &size, sizeof(RAWINPUTHEADER));
+    if (result == (UINT)-1) {
+        DWORD err = GetLastError();
+        printf("GetRawInputData failed: %lu\n", err);
         return;
     }
 
-    if (raw->header.dwType == RIM_TYPEHID && raw->header.hDevice != NULL) {
-        RID_DEVICE_INFO dev_info = {0};
-        dev_info.cbSize = sizeof(dev_info);
-        UINT dev_info_size = sizeof(dev_info);
-        
-        if (GetRawInputDeviceInfo(raw->header.hDevice, RIDI_DEVICEINFO, &dev_info, &dev_info_size) > 0) {
-            if (win32_is_dualsense(dev_info.hid.dwVendorId, dev_info.hid.dwProductId)) {
-                win32_handle_dualsense_connection(raw->header.hDevice);
-                return;
-            }
+    // Only process HID devices
+    if (raw->header.dwType != RIM_TYPEHID) return;
+
+    // Get device info
+    RID_DEVICE_INFO dev_info = {0};
+    dev_info.cbSize = sizeof(dev_info);
+    UINT info_size = sizeof(dev_info);
+    
+    if (GetRawInputDeviceInfo(raw->header.hDevice, RIDI_DEVICEINFO, &dev_info, &info_size) == (UINT)-1) {
+        printf("Failed to get device info\n");
+        return;
+    }
+
+    // Handle Sony controllers
+    if (dev_info.hid.dwVendorId == 0x054C) { // Sony VID
+        if (dev_info.hid.dwProductId == 0x0CE6 || // DualSense
+            dev_info.hid.dwProductId == 0x05C4 || // DS4 v1
+            dev_info.hid.dwProductId == 0x09CC) { // DS4 v2
+            win32_handle_ds_connection(raw->header.hDevice);
+            return;
         }
+    }
 
-        for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
-            if (win32_gamepad_ctx.win32_raw_devices[i].handle == raw->header.hDevice) {
-                PHIDP_PREPARSED_DATA pp_data = win32_gamepad_ctx.win32_raw_devices[i].pp_data;
-                PCHAR report = (PCHAR)raw->data.hid.bRawData;
-                USHORT report_length = raw->data.hid.dwSizeHid;
-
-                USAGE buttons[PAL_MAX_BUTTONS];
-                ULONG button_length = win32_gamepad_ctx.win32_raw_devices[i].button_count;
-                if (HidP_GetUsages(HidP_Input, HID_USAGE_PAGE_BUTTON, 0, buttons, &button_length, 
-                                  pp_data, report, report_length) == HIDP_STATUS_SUCCESS) {
-                    for (int j = 0; j < win32_gamepad_ctx.win32_raw_devices[i].button_count; j++) {
-                        win32_gamepad_ctx.win32_raw_devices[i].buttons[j].value = 0.0f;
-                    }
-                    for (ULONG j = 0; j < button_length; j++) {
-                        if (buttons[j] <= win32_gamepad_ctx.win32_raw_devices[i].button_count) {
-                            win32_gamepad_ctx.win32_raw_devices[i].buttons[buttons[j]-1].value = 1.0f;
-                        }
-                    }
-                }
-
-                for (int j = 0; j < win32_gamepad_ctx.win32_raw_devices[i].axis_count; j++) {
-                    ULONG value;
-                    if (HidP_GetUsageValue(HidP_Input, 
-                                          win32_gamepad_ctx.win32_raw_devices[i].axes[j].usage >> 8,
-                                          0, 
-                                          win32_gamepad_ctx.win32_raw_devices[i].axes[j].usage & 0xFF,
-                                          &value, 
-                                          pp_data, 
-                                          report, 
-                                          report_length) == HIDP_STATUS_SUCCESS) {
-                        float normalized = (2.0f * (value - win32_gamepad_ctx.win32_raw_devices[i].axes[j].min) / 
-                                         (win32_gamepad_ctx.win32_raw_devices[i].axes[j].max - win32_gamepad_ctx.win32_raw_devices[i].axes[j].min)) - 1.0f;
-                        win32_gamepad_ctx.win32_raw_devices[i].axes[j].value = 
-                            win32_gamepad_ctx.win32_raw_devices[i].axes[j].inverted ? -normalized : normalized;
-                    }
-                }
+    // Generic HID device handling
+    for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
+        if (!win32_gamepad_ctx.hid_devices[i].connected) {
+            char path[256] = {0};
+            UINT path_size = sizeof(path);
+            
+            if (GetRawInputDeviceInfo(raw->header.hDevice, RIDI_DEVICENAME, path, &path_size) == (UINT)-1) {
+                printf("Failed to get device path\n");
                 break;
             }
+
+            HANDLE hDevice = CreateFileA(
+                path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                OPEN_EXISTING,
+                0,
+                NULL
+            );
+
+            if (hDevice == INVALID_HANDLE_VALUE) {
+                printf("CreateFile failed: %lu\n", GetLastError());
+                break;
+            }
+
+            PHIDP_PREPARSED_DATA pp_data = NULL;
+            if (!HidD_GetPreparsedData(hDevice, &pp_data)) {
+                CloseHandle(hDevice);
+                printf("HidD_GetPreparsedData failed\n");
+                break;
+            }
+
+            HIDP_CAPS caps;
+            if (HidP_GetCaps(pp_data, &caps) != HIDP_STATUS_SUCCESS) {
+                HidD_FreePreparsedData(pp_data);
+                CloseHandle(hDevice);
+                printf("HidP_GetCaps failed\n");
+                break;
+            }
+
+            // Store device info
+            win32_gamepad_ctx.hid_devices[i].handle = hDevice;
+            win32_gamepad_ctx.hid_devices[i].pp_data = pp_data;
+            win32_gamepad_ctx.hid_devices[i].vendor_id = dev_info.hid.dwVendorId;
+            win32_gamepad_ctx.hid_devices[i].product_id = dev_info.hid.dwProductId;
+            
+            // Get device name
+            wchar_t wname[128] = {0};
+            if (HidD_GetProductString(hDevice, wname, sizeof(wname))) {
+                WideCharToMultiByte(CP_UTF8, 0, wname, -1, 
+                                  win32_gamepad_ctx.hid_devices[i].name, 
+                                  sizeof(win32_gamepad_ctx.hid_devices[i].name), 
+                                  NULL, NULL);
+            } else {
+                strncpy(win32_gamepad_ctx.hid_devices[i].name, "Generic HID Gamepad",
+                       sizeof(win32_gamepad_ctx.hid_devices[i].name) - 1);
+            }
+
+            // Initialize buttons and axes
+            win32_init_hid_device_buttons(&win32_gamepad_ctx.hid_devices[i], pp_data, &caps);
+            win32_init_hid_device_axes(&win32_gamepad_ctx.hid_devices[i], pp_data, &caps);
+            
+            win32_gamepad_ctx.hid_devices[i].connected = TRUE;
+            break;
         }
     }
 }
@@ -1842,16 +2149,16 @@ static void win32_update_xinput() {
     for (DWORD i = 0; i < 4; i++) {
         XINPUT_STATE state;
         if (XInputGetState(i, &state) == ERROR_SUCCESS) {
-            win32_gamepad_ctx.win32_xinput_connected[i] = TRUE;
-            win32_gamepad_ctx.win32_xinput_states[i] = state;
+            win32_gamepad_ctx.xinput_connected[i] = TRUE;
+            win32_gamepad_ctx.xinput_states[i] = state;
         } else {
-            win32_gamepad_ctx.win32_xinput_connected[i] = FALSE;
+            win32_gamepad_ctx.xinput_connected[i] = FALSE;
         }
     }
 }
 
 static void win32_xinput_to_unified(DWORD index, pal_gamepad_state* out) {
-    XINPUT_STATE* xi = &win32_gamepad_ctx.win32_xinput_states[index];
+    XINPUT_STATE* xi = &win32_gamepad_ctx.xinput_states[index];
     
     out->axes.left_x = fmaxf(-1.0f, xi->Gamepad.sThumbLX / 32767.0f);
     out->axes.left_y = fmaxf(-1.0f, xi->Gamepad.sThumbLY / 32767.0f);
@@ -1929,7 +2236,7 @@ pal_bool platform_gamepad_load_mappings(const char* filename) {
     
     char line[512];
     while (fgets(line, sizeof(line), file) && 
-           win32_gamepad_ctx.win32_mapping_count < PAL_MAX_MAPPINGS) {
+           win32_gamepad_ctx.mapping_count < PAL_MAX_MAPPINGS) {
         if (line[0] == '#' || line[0] == '\n') continue;
         
         char* tokens[32];
@@ -1942,7 +2249,7 @@ pal_bool platform_gamepad_load_mappings(const char* filename) {
         
         if (token_count < 5) continue;
         
-        win32_gamepad_mapping* map = &win32_gamepad_ctx.win32_mappings[win32_gamepad_ctx.win32_mapping_count++];
+        win32_gamepad_mapping* map = &win32_gamepad_ctx.mappings[win32_gamepad_ctx.mapping_count++];
         memset(map, 0, sizeof(win32_gamepad_mapping));
         
         map->vendor_id = (uint16_t)strtoul(tokens[1], NULL, 16);
@@ -1966,7 +2273,7 @@ pal_bool platform_gamepad_load_mappings(const char* filename) {
 
 void platform_gamepad_init(pal_window* window) {
     memset(&win32_gamepad_ctx, 0, sizeof(win32_gamepad_ctx));
-    win32_gamepad_ctx.win32_hwnd = window->hwnd;
+    win32_gamepad_ctx.hwnd = window->hwnd;
 
     RAWINPUTDEVICE rid[2] = {
         {0x01, 0x05, RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, window->hwnd},
@@ -1974,7 +2281,7 @@ void platform_gamepad_init(pal_window* window) {
     };
     RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
 
-    win32_gamepad_ctx.win32_initialized = TRUE;
+    win32_gamepad_ctx.initialized = TRUE;
 }
 
 int platform_gamepad_get_count() {
@@ -1983,144 +2290,229 @@ int platform_gamepad_get_count() {
 #if PAL_XINPUT_ENABLED
     win32_update_xinput();
     for (int i = 0; i < 4; i++) {
-        if (win32_gamepad_ctx.win32_xinput_connected[i]) count++;
+        if (win32_gamepad_ctx.xinput_connected[i]) count++;
     }
 #endif
 
     for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
-        if (win32_gamepad_ctx.win32_raw_devices[i].connected) count++;
-        if (win32_gamepad_ctx.win32_dualsense_devices[i].connected) count++;
+        if (win32_gamepad_ctx.hid_devices[i].connected) count++;
+        if (win32_gamepad_ctx.ds_devices[i].connected) count++;
     }
     
     return count;
 }
 
 pal_bool platform_gamepad_get_state(int index, pal_gamepad_state* out_state) {
-    if (!out_state) return FALSE;
-    memset(out_state, 0, sizeof(pal_gamepad_state));
-    
-#if PAL_XINPUT_ENABLED
-    // Check XInput devices first (indices 0-3)
-    if (index < 4 && win32_gamepad_ctx.win32_xinput_connected[index]) {
-        win32_xinput_to_unified(index, out_state);
-        return TRUE;
+    // Sanity checks
+    if (!out_state || !win32_gamepad_ctx.initialized) {
+        return FALSE;
     }
-    // Adjust index for non-XInput devices
-    index -= 4;
+    memset(out_state, 0, sizeof(pal_gamepad_state));
+
+    // 1. Handle XInput devices (indices 0-3)
+#if PAL_XINPUT_ENABLED
+    if (index < 4) {
+        if (win32_gamepad_ctx.xinput_connected[index]) {
+            // Normalize analog sticks (-1.0 to 1.0)
+            out_state->axes.left_x = fmaxf(-1.0f, 
+                win32_gamepad_ctx.xinput_states[index].Gamepad.sThumbLX / 32767.0f);
+            out_state->axes.left_y = fmaxf(-1.0f,
+                win32_gamepad_ctx.xinput_states[index].Gamepad.sThumbLY / 32767.0f);
+            out_state->axes.right_x = fmaxf(-1.0f,
+                win32_gamepad_ctx.xinput_states[index].Gamepad.sThumbRX / 32767.0f);
+            out_state->axes.right_y = fmaxf(-1.0f,
+                win32_gamepad_ctx.xinput_states[index].Gamepad.sThumbRY / 32767.0f);
+            
+            // Normalize triggers (0.0 to 1.0)
+            out_state->axes.left_trigger = 
+                win32_gamepad_ctx.xinput_states[index].Gamepad.bLeftTrigger / 255.0f;
+            out_state->axes.right_trigger = 
+                win32_gamepad_ctx.xinput_states[index].Gamepad.bRightTrigger / 255.0f;
+
+            // Digital buttons
+            out_state->buttons.a = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_A) != 0;
+            out_state->buttons.b = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_B) != 0;
+            out_state->buttons.x = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_X) != 0;
+            out_state->buttons.y = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_Y) != 0;
+            out_state->buttons.back = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_BACK) != 0;
+            out_state->buttons.start = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_START) != 0;
+            out_state->buttons.left_stick = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB) != 0;
+            out_state->buttons.right_stick = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_THUMB) != 0;
+            out_state->buttons.left_shoulder = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
+            out_state->buttons.right_shoulder = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+            
+            // D-pad
+            out_state->buttons.dpad_up = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_UP) != 0;
+            out_state->buttons.dpad_down = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) != 0;
+            out_state->buttons.dpad_left = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) != 0;
+            out_state->buttons.dpad_right = 
+                (win32_gamepad_ctx.xinput_states[index].Gamepad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0;
+
+            // Metadata
+            strncpy(out_state->name, "Xbox Controller", sizeof(out_state->name));
+            out_state->vendor_id = 0x045E; // Microsoft
+            out_state->product_id = (index < 2) ? 0x028E : 0x02FD; // 360 vs One
+            out_state->connected = TRUE;
+            out_state->is_xinput = TRUE;
+            return TRUE;
+        }
+        index -= 4; // Adjust index for non-XInput devices
+    }
 #endif
 
-    // Check DualSense devices
+    // 2. Handle DualSense/DS4 devices
     if (index >= 0 && index < PAL_MAX_GAMEPADS && 
-        win32_gamepad_ctx.win32_dualsense_devices[index].connected) {
-        win32_update_dualsense(index);
-        win32_dualsense_to_unified(index, out_state);
-        return TRUE;
+        win32_gamepad_ctx.ds_devices[index].connected) {
+        
+        win32_update_ds_state(index);
+        
+        if (win32_gamepad_ctx.ds_devices[index].state.has_report) {
+            uint8_t* report = win32_gamepad_ctx.ds_devices[index].state.report;
+            pal_bool is_bluetooth = (win32_gamepad_ctx.ds_devices[index].state.report_size > 64);
+
+            // Skip Bluetooth header if present
+            if (is_bluetooth && report[0] == DS_BT_REPORT_ID) {
+                report++;
+            }
+
+            if (report[0] == DS_INPUT_REPORT_ID) {
+                // Buttons (byte 5-9)
+                out_state->buttons.a = (report[7] & DS_BUTTON_MASK_CROSS) != 0;
+                out_state->buttons.b = (report[7] & DS_BUTTON_MASK_CIRCLE) != 0;
+                out_state->buttons.x = (report[7] & DS_BUTTON_MASK_SQUARE) != 0;
+                out_state->buttons.y = (report[7] & DS_BUTTON_MASK_TRIANGLE) != 0;
+                out_state->buttons.left_shoulder = (report[7] & DS_BUTTON_MASK_L1) != 0;
+                out_state->buttons.right_shoulder = (report[7] & DS_BUTTON_MASK_R1) != 0;
+                out_state->buttons.back = (report[8] & DS_BUTTON_MASK_SHARE) != 0;
+                out_state->buttons.start = (report[8] & DS_BUTTON_MASK_OPTIONS) != 0;
+                out_state->buttons.left_stick = (report[8] & DS_BUTTON_MASK_L3) != 0;
+                out_state->buttons.right_stick = (report[8] & DS_BUTTON_MASK_R3) != 0;
+                out_state->buttons.guide = (report[9] & DS_BUTTON_MASK_PS) != 0;
+                out_state->buttons.touchpad_button = (report[9] & DS_BUTTON_MASK_TOUCHPAD) != 0;
+
+                // D-pad (nibble in byte 5)
+                uint8_t dpad = report[5] & 0x0F;
+                out_state->buttons.dpad_up = (dpad == 7 || dpad == 0 || dpad == 1);
+                out_state->buttons.dpad_right = (dpad == 1 || dpad == 2 || dpad == 3);
+                out_state->buttons.dpad_down = (dpad == 3 || dpad == 4 || dpad == 5);
+                out_state->buttons.dpad_left = (dpad == 5 || dpad == 6 || dpad == 7);
+
+                // Analog sticks (-1.0 to 1.0)
+                out_state->axes.left_x = (report[1] - 127) / 127.0f;
+                out_state->axes.left_y = (report[2] - 127) / 127.0f;
+                out_state->axes.right_x = (report[3] - 127) / 127.0f;
+                out_state->axes.right_y = (report[4] - 127) / 127.0f;
+
+                // Triggers (0.0 to 1.0)
+                out_state->axes.left_trigger = report[5] / 255.0f;
+                out_state->axes.right_trigger = report[6] / 255.0f;
+
+                // Metadata
+                strncpy(out_state->name, win32_gamepad_ctx.ds_devices[index].name, 
+                       sizeof(out_state->name));
+                out_state->vendor_id = win32_gamepad_ctx.ds_devices[index].vendor_id;
+                out_state->product_id = win32_gamepad_ctx.ds_devices[index].product_id;
+                out_state->connected = TRUE;
+                out_state->is_xinput = FALSE;
+                return TRUE;
+            }
+        }
     }
-    
-    // Check raw HID devices
+
+    // 3. Handle generic HID devices
     if (index >= 0 && index < PAL_MAX_GAMEPADS && 
-        win32_gamepad_ctx.win32_raw_devices[index].connected) {
+        win32_gamepad_ctx.hid_devices[index].connected) {
         
-        // Find matching mapping
-        const win32_gamepad_mapping* map = NULL;
-        for (int i = 0; i < win32_gamepad_ctx.win32_mapping_count; i++) {
-            if (win32_gamepad_ctx.win32_mappings[i].vendor_id == win32_gamepad_ctx.win32_raw_devices[index].vendor_id &&
-                win32_gamepad_ctx.win32_mappings[i].product_id == win32_gamepad_ctx.win32_raw_devices[index].product_id) {
-                map = &win32_gamepad_ctx.win32_mappings[i];
-                break;
-            }
-        }
-        
-        // Use default mapping if none found
-        if (!map) {
-            // Default Xbox-like mapping for unrecognized devices
-            static const win32_gamepad_mapping default_mapping = {
-                0, 0, "Generic Gamepad",
-                // Button map (matches XInput order)
-                {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
-                // Axis map
-                {
-                    {0x30, FALSE}, // leftx
-                    {0x31, TRUE},  // lefty (inverted)
-                    {0x32, FALSE}, // rightx
-                    {0x33, TRUE}, // righty (inverted)
-                    {0x34, FALSE}, // lefttrigger
-                    {0x35, FALSE}  // righttrigger
-                }
-            };
-            map = &default_mapping;
-        }
-        
-        // Map buttons
-        for (int i = 0; i < 15; i++) {
-            if (map->button_map[i] == 0) continue;
+        // Map buttons using the device's button caps
+        for (int i = 0; i < win32_gamepad_ctx.hid_devices[index].button_count; i++) {
+            uint8_t usage = win32_gamepad_ctx.hid_devices[index].buttons[i].usage;
+            float value = win32_gamepad_ctx.hid_devices[index].buttons[i].value;
             
-            pal_bool* dest = NULL;
-            switch (i) {
-                case 0: dest = &out_state->buttons.a; break;
-                case 1: dest = &out_state->buttons.b; break;
-                case 2: dest = &out_state->buttons.x; break;
-                case 3: dest = &out_state->buttons.y; break;
-                case 4: dest = &out_state->buttons.back; break;
-                case 5: dest = &out_state->buttons.guide; break;
-                case 6: dest = &out_state->buttons.start; break;
-                case 7: dest = &out_state->buttons.left_stick; break;
-                case 8: dest = &out_state->buttons.right_stick; break;
-                case 9: dest = &out_state->buttons.left_shoulder; break;
-                case 10: dest = &out_state->buttons.right_shoulder; break;
-                case 11: dest = &out_state->buttons.dpad_up; break;
-                case 12: dest = &out_state->buttons.dpad_down; break;
-                case 13: dest = &out_state->buttons.dpad_left; break;
-                case 14: dest = &out_state->buttons.dpad_right; break;
-            }
-            
-            if (dest) {
-                for (int j = 0; j < win32_gamepad_ctx.win32_raw_devices[index].button_count; j++) {
-                    if (win32_gamepad_ctx.win32_raw_devices[index].buttons[j].usage == map->button_map[i]) {
-                        *dest = (win32_gamepad_ctx.win32_raw_devices[index].buttons[j].value > 0.5f);
-                        break;
+            // Find mapping for this button
+            for (int j = 0; j < win32_gamepad_ctx.mapping_count; j++) {
+                if (win32_gamepad_ctx.mappings[j].vendor_id == win32_gamepad_ctx.hid_devices[index].vendor_id &&
+                    win32_gamepad_ctx.mappings[j].product_id == win32_gamepad_ctx.hid_devices[index].product_id) {
+                    
+                    for (int k = 0; k < 15; k++) {
+                        if (win32_gamepad_ctx.mappings[j].button_map[k] == usage) {
+                            switch (k) {
+								case 0: out_state->buttons.a = (value > 0.5f); break;
+								case 1: out_state->buttons.b = (value > 0.5f); break;
+								case 2: out_state->buttons.x = (value > 0.5f); break;
+								case 3: out_state->buttons.y = (value > 0.5f); break;
+								case 4: out_state->buttons.back = (value > 0.5f); break;
+								case 5: out_state->buttons.start = (value > 0.5f); break;
+								case 6: out_state->buttons.guide = (value > 0.5f); break;
+								case 7: out_state->buttons.left_stick = (value > 0.5f); break;
+								case 8: out_state->buttons.right_stick = (value > 0.5f); break;
+								case 9: out_state->buttons.left_shoulder = (value > 0.5f); break;
+								case 10: out_state->buttons.right_shoulder = (value > 0.5f); break;
+								case 11: out_state->buttons.dpad_up = (value > 0.5f); break;
+								case 12: out_state->buttons.dpad_down = (value > 0.5f); break;
+								case 13: out_state->buttons.dpad_left = (value > 0.5f); break;
+								case 14: out_state->buttons.dpad_right = (value > 0.5f); break;
+								case 15: out_state->buttons.touchpad_button = (value > 0.5f); break;
+                                // ... map all other buttons ...
+                            }
+                        }
                     }
                 }
             }
         }
-        
-        // Map axes
-        for (int i = 0; i < 6; i++) {
-            if (map->axis_map[i].usage == 0) continue;
+
+        // Map axes using the device's value caps
+        for (int i = 0; i < win32_gamepad_ctx.hid_devices[index].axis_count; i++) {
+            uint16_t usage = win32_gamepad_ctx.hid_devices[index].axes[i].usage;
+            float value = win32_gamepad_ctx.hid_devices[index].axes[i].value;
             
-            float* dest = NULL;
-            switch (i) {
-                case 0: dest = &out_state->axes.left_x; break;
-                case 1: dest = &out_state->axes.left_y; break;
-                case 2: dest = &out_state->axes.right_x; break;
-                case 3: dest = &out_state->axes.right_y; break;
-                case 4: dest = &out_state->axes.left_trigger; break;
-                case 5: dest = &out_state->axes.right_trigger; break;
-            }
-            
-            if (dest) {
-                for (int j = 0; j < win32_gamepad_ctx.win32_raw_devices[index].axis_count; j++) {
-                    if (win32_gamepad_ctx.win32_raw_devices[index].axes[j].usage == map->axis_map[i].usage) {
-                        float value = win32_gamepad_ctx.win32_raw_devices[index].axes[j].value;
-                        *dest = map->axis_map[i].inverted ? -value : value;
-                        break;
+            // Find mapping for this axis
+            for (int j = 0; j < win32_gamepad_ctx.mapping_count; j++) {
+                if (win32_gamepad_ctx.mappings[j].vendor_id == win32_gamepad_ctx.hid_devices[index].vendor_id &&
+                    win32_gamepad_ctx.mappings[j].product_id == win32_gamepad_ctx.hid_devices[index].product_id) {
+                    
+                    for (int k = 0; k < 6; k++) {
+                        if (win32_gamepad_ctx.mappings[j].axis_map[k].usage == usage) {
+                            float normalized = win32_gamepad_ctx.mappings[j].axis_map[k].inverted ? -value : value;
+                            switch (k) {
+                            case 0: out_state->axes.left_x = normalized; break;
+                            case 1: out_state->axes.left_y = normalized; break;
+                            case 2: out_state->axes.right_x = normalized; break;
+                            case 3: out_state->axes.right_y = normalized; break;
+                            case 4: out_state->axes.left_trigger = (normalized + 1.0f) * 0.5f; break;
+                            case 5: out_state->axes.right_trigger = (normalized + 1.0f) * 0.5f; break;
+                            }
+                        }
                     }
                 }
             }
         }
-        
-        // Set metadata
-        strncpy(out_state->name, win32_gamepad_ctx.win32_raw_devices[index].name, sizeof(out_state->name));
-        out_state->vendor_id = win32_gamepad_ctx.win32_raw_devices[index].vendor_id;
-        out_state->product_id = win32_gamepad_ctx.win32_raw_devices[index].product_id;
+
+        // Metadata
+        strncpy(out_state->name, win32_gamepad_ctx.hid_devices[index].name, 
+               sizeof(out_state->name));
+        out_state->vendor_id = win32_gamepad_ctx.hid_devices[index].vendor_id;
+        out_state->product_id = win32_gamepad_ctx.hid_devices[index].product_id;
         out_state->connected = TRUE;
         out_state->is_xinput = FALSE;
-        
         return TRUE;
     }
-    
+
     return FALSE;
 }
+
 // Additional utility functions for device enumeration
 static void win32_enumerate_devices() {
     UINT num_devices = 0;
@@ -2150,7 +2542,7 @@ static void win32_enumerate_devices() {
 
                 // Handle other HID devices
                 for (int j = 0; j < PAL_MAX_GAMEPADS; j++) {
-                    if (!win32_gamepad_ctx.win32_raw_devices[j].connected) {
+                    if (!win32_gamepad_ctx.hid_devices[j].connected) {
                         char name[128] = {0};
                         UINT name_size = sizeof(name);
                         GetRawInputDeviceInfo(devices[i].hDevice, RIDI_DEVICENAME, name, &name_size);
@@ -2170,12 +2562,12 @@ static void win32_enumerate_devices() {
                                 HIDP_CAPS caps;
                                 if (HidP_GetCaps(pp_data, &caps) == HIDP_STATUS_SUCCESS) {
                                     // Store basic device info
-                                    win32_gamepad_ctx.win32_raw_devices[j].handle = hDevice;
-                                    win32_gamepad_ctx.win32_raw_devices[j].pp_data = pp_data;
-                                    win32_gamepad_ctx.win32_raw_devices[j].vendor_id = dev_info.hid.dwVendorId;
-                                    win32_gamepad_ctx.win32_raw_devices[j].product_id = dev_info.hid.dwProductId;
-                                    strncpy(win32_gamepad_ctx.win32_raw_devices[j].name, name, sizeof(win32_gamepad_ctx.win32_raw_devices[j].name) - 1);
-                                    win32_gamepad_ctx.win32_raw_devices[j].name[sizeof(win32_gamepad_ctx.win32_raw_devices[j].name) - 1] = '\0';
+                                    win32_gamepad_ctx.hid_devices[j].handle = hDevice;
+                                    win32_gamepad_ctx.hid_devices[j].pp_data = pp_data;
+                                    win32_gamepad_ctx.hid_devices[j].vendor_id = dev_info.hid.dwVendorId;
+                                    win32_gamepad_ctx.hid_devices[j].product_id = dev_info.hid.dwProductId;
+                                    strncpy(win32_gamepad_ctx.hid_devices[j].name, name, sizeof(win32_gamepad_ctx.hid_devices[j].name) - 1);
+                                    win32_gamepad_ctx.hid_devices[j].name[sizeof(win32_gamepad_ctx.hid_devices[j].name) - 1] = '\0';
 
                                     // Initialize buttons
                                     USHORT button_caps_length = caps.NumberInputButtonCaps;
@@ -2186,16 +2578,16 @@ static void win32_enumerate_devices() {
                                             for (USHORT btn_idx = 0; btn_idx < button_caps_length; btn_idx++) {
                                                 if (button_caps[btn_idx].IsRange) {
                                                     USHORT btn_count = button_caps[btn_idx].Range.UsageMax - button_caps[btn_idx].Range.UsageMin + 1;
-                                                    for (USHORT k = 0; k < btn_count && win32_gamepad_ctx.win32_raw_devices[j].button_count < PAL_MAX_BUTTONS; k++) {
-                                                        win32_gamepad_ctx.win32_raw_devices[j].buttons[win32_gamepad_ctx.win32_raw_devices[j].button_count].usage = 
+                                                    for (USHORT k = 0; k < btn_count && win32_gamepad_ctx.hid_devices[j].button_count < PAL_MAX_BUTTONS; k++) {
+                                                        win32_gamepad_ctx.hid_devices[j].buttons[win32_gamepad_ctx.hid_devices[j].button_count].usage = 
                                                             button_caps[btn_idx].Range.UsageMin + k;
-                                                        win32_gamepad_ctx.win32_raw_devices[j].button_count++;
+                                                        win32_gamepad_ctx.hid_devices[j].button_count++;
                                                     }
                                                 } else {
-                                                    if (win32_gamepad_ctx.win32_raw_devices[j].button_count < PAL_MAX_BUTTONS) {
-                                                        win32_gamepad_ctx.win32_raw_devices[j].buttons[win32_gamepad_ctx.win32_raw_devices[j].button_count].usage = 
+                                                    if (win32_gamepad_ctx.hid_devices[j].button_count < PAL_MAX_BUTTONS) {
+                                                        win32_gamepad_ctx.hid_devices[j].buttons[win32_gamepad_ctx.hid_devices[j].button_count].usage = 
                                                             button_caps[btn_idx].NotRange.Usage;
-                                                        win32_gamepad_ctx.win32_raw_devices[j].button_count++;
+                                                        win32_gamepad_ctx.hid_devices[j].button_count++;
                                                     }
                                                 }
                                             }
@@ -2208,26 +2600,26 @@ static void win32_enumerate_devices() {
                                     HIDP_VALUE_CAPS* value_caps = (HIDP_VALUE_CAPS*)malloc(value_caps_length * sizeof(HIDP_VALUE_CAPS));
                                     if (value_caps) {
                                         if (HidP_GetValueCaps(HidP_Input, value_caps, &value_caps_length, pp_data) == HIDP_STATUS_SUCCESS) {
-                                            win32_gamepad_ctx.win32_raw_devices[j].axis_count = 0;
-                                            for (int k = 0; k < value_caps_length && win32_gamepad_ctx.win32_raw_devices[j].axis_count < PAL_MAX_AXES; k++) {
+                                            win32_gamepad_ctx.hid_devices[j].axis_count = 0;
+                                            for (int k = 0; k < value_caps_length && win32_gamepad_ctx.hid_devices[j].axis_count < PAL_MAX_AXES; k++) {
                                                 if (value_caps[k].UsagePage == 1) { // Generic Desktop Page
                                                     USAGE usage = value_caps[k].IsRange ? value_caps[k].Range.UsageMin : value_caps[k].NotRange.Usage;
                                                     
-                                                    win32_gamepad_ctx.win32_raw_devices[j].axes[win32_gamepad_ctx.win32_raw_devices[j].axis_count].usage = 
+                                                    win32_gamepad_ctx.hid_devices[j].axes[win32_gamepad_ctx.hid_devices[j].axis_count].usage = 
                                                         (value_caps[k].UsagePage << 8) | usage;
-                                                    win32_gamepad_ctx.win32_raw_devices[j].axes[win32_gamepad_ctx.win32_raw_devices[j].axis_count].min = 
+                                                    win32_gamepad_ctx.hid_devices[j].axes[win32_gamepad_ctx.hid_devices[j].axis_count].min = 
                                                         value_caps[k].LogicalMin;
-                                                    win32_gamepad_ctx.win32_raw_devices[j].axes[win32_gamepad_ctx.win32_raw_devices[j].axis_count].max = 
+                                                    win32_gamepad_ctx.hid_devices[j].axes[win32_gamepad_ctx.hid_devices[j].axis_count].max = 
                                                         value_caps[k].LogicalMax;
-                                                    win32_gamepad_ctx.win32_raw_devices[j].axes[win32_gamepad_ctx.win32_raw_devices[j].axis_count].inverted = FALSE;
-                                                    win32_gamepad_ctx.win32_raw_devices[j].axis_count++;
+                                                    win32_gamepad_ctx.hid_devices[j].axes[win32_gamepad_ctx.hid_devices[j].axis_count].inverted = FALSE;
+                                                    win32_gamepad_ctx.hid_devices[j].axis_count++;
                                                 }
                                             }
                                         }
                                         free(value_caps);
                                     }
 
-                                    win32_gamepad_ctx.win32_raw_devices[j].connected = TRUE;
+                                    win32_gamepad_ctx.hid_devices[j].connected = TRUE;
                                     break;
                                 } else {
                                     HidD_FreePreparsedData(pp_data);
@@ -2258,7 +2650,7 @@ static void win32_handle_device_change(HANDLE hDevice, DWORD dwChange) {
             } else {
                 // Handle other gamepad connections
                 for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
-                    if (!win32_gamepad_ctx.win32_raw_devices[i].connected) {
+                    if (!win32_gamepad_ctx.hid_devices[i].connected) {
                         char name[128] = {0};
                         UINT name_size = sizeof(name);
                         GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, name, &name_size);
@@ -2277,12 +2669,12 @@ static void win32_handle_device_change(HANDLE hDevice, DWORD dwChange) {
                             if (HidD_GetPreparsedData(hNewDevice, &pp_data)) {
                                 HIDP_CAPS caps;
                                 if (HidP_GetCaps(pp_data, &caps) == HIDP_STATUS_SUCCESS) {
-                                    win32_gamepad_ctx.win32_raw_devices[i].handle = hNewDevice;
-                                    win32_gamepad_ctx.win32_raw_devices[i].pp_data = pp_data;
-                                    win32_gamepad_ctx.win32_raw_devices[i].vendor_id = dev_info.hid.dwVendorId;
-                                    win32_gamepad_ctx.win32_raw_devices[i].product_id = dev_info.hid.dwProductId;
-                                    strncpy(win32_gamepad_ctx.win32_raw_devices[i].name, name, sizeof(win32_gamepad_ctx.win32_raw_devices[i].name) - 1);
-                                    win32_gamepad_ctx.win32_raw_devices[i].connected = TRUE;
+                                    win32_gamepad_ctx.hid_devices[i].handle = hNewDevice;
+                                    win32_gamepad_ctx.hid_devices[i].pp_data = pp_data;
+                                    win32_gamepad_ctx.hid_devices[i].vendor_id = dev_info.hid.dwVendorId;
+                                    win32_gamepad_ctx.hid_devices[i].product_id = dev_info.hid.dwProductId;
+                                    strncpy(win32_gamepad_ctx.hid_devices[i].name, name, sizeof(win32_gamepad_ctx.hid_devices[i].name) - 1);
+                                    win32_gamepad_ctx.hid_devices[i].connected = TRUE;
                                     break;
                                 } else {
                                     HidD_FreePreparsedData(pp_data);
@@ -2298,22 +2690,22 @@ static void win32_handle_device_change(HANDLE hDevice, DWORD dwChange) {
         } else if (dwChange == GIDC_REMOVAL) {
             // Handle device disconnection
             for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
-                if (win32_gamepad_ctx.win32_dualsense_devices[i].connected && 
-                    win32_gamepad_ctx.win32_dualsense_devices[i].handle == hDevice) {
-                    CancelIo(win32_gamepad_ctx.win32_dualsense_devices[i].handle);
-                    if (win32_gamepad_ctx.win32_dualsense_devices[i].state.overlapped.hEvent) {
-                        CloseHandle(win32_gamepad_ctx.win32_dualsense_devices[i].state.overlapped.hEvent);
+                if (win32_gamepad_ctx.ds_devices[i].connected && 
+                    win32_gamepad_ctx.ds_devices[i].handle == hDevice) {
+                    CancelIo(win32_gamepad_ctx.ds_devices[i].handle);
+                    if (win32_gamepad_ctx.ds_devices[i].state.overlapped.hEvent) {
+                        CloseHandle(win32_gamepad_ctx.ds_devices[i].state.overlapped.hEvent);
                     }
-                    CloseHandle(win32_gamepad_ctx.win32_dualsense_devices[i].handle);
-                    win32_gamepad_ctx.win32_dualsense_devices[i].connected = FALSE;
+                    CloseHandle(win32_gamepad_ctx.ds_devices[i].handle);
+                    win32_gamepad_ctx.ds_devices[i].connected = FALSE;
                     break;
                 }
 
-                if (win32_gamepad_ctx.win32_raw_devices[i].connected && 
-                    win32_gamepad_ctx.win32_raw_devices[i].handle == hDevice) {
-                    HidD_FreePreparsedData(win32_gamepad_ctx.win32_raw_devices[i].pp_data);
-                    CloseHandle(win32_gamepad_ctx.win32_raw_devices[i].handle);
-                    win32_gamepad_ctx.win32_raw_devices[i].connected = FALSE;
+                if (win32_gamepad_ctx.hid_devices[i].connected && 
+                    win32_gamepad_ctx.hid_devices[i].handle == hDevice) {
+                    HidD_FreePreparsedData(win32_gamepad_ctx.hid_devices[i].pp_data);
+                    CloseHandle(win32_gamepad_ctx.hid_devices[i].handle);
+                    win32_gamepad_ctx.hid_devices[i].connected = FALSE;
                     break;
                 }
             }
@@ -2359,7 +2751,7 @@ pal_bool platform_gamepad_get_battery_info(int index, pal_gamepad_state* out) {
     memset(out, 0, sizeof(pal_gamepad_state));
     
 #if PAL_XINPUT_ENABLED
-    if (index < 4 && win32_gamepad_ctx.win32_xinput_connected[index]) {
+    if (index < 4 && win32_gamepad_ctx.xinput_connected[index]) {
         XINPUT_BATTERY_INFORMATION battery;
         if (XInputGetBatteryInformation(index, BATTERY_DEVTYPE_GAMEPAD, &battery) == ERROR_SUCCESS) {
             out->battery_level = (float)battery.BatteryLevel / 100.0f;
@@ -2372,19 +2764,19 @@ pal_bool platform_gamepad_get_battery_info(int index, pal_gamepad_state* out) {
 #endif
 
     if (index >= 0 && index < PAL_MAX_GAMEPADS && 
-        win32_gamepad_ctx.win32_dualsense_devices[index].connected) {
+        win32_gamepad_ctx.ds_devices[index].connected) {
         // DualSense battery reporting is in the input report
-        if (win32_gamepad_ctx.win32_dualsense_devices[index].state.has_report) {
-            uint8_t battery = win32_gamepad_ctx.win32_dualsense_devices[index].state.report[52] & 0x0F;
+        if (win32_gamepad_ctx.ds_devices[index].state.has_report) {
+            uint8_t battery = win32_gamepad_ctx.ds_devices[index].state.report[52] & 0x0F;
             out->battery_level = (float)battery / 10.0f; // 0-10 scale
-            out->is_charging = (win32_gamepad_ctx.win32_dualsense_devices[index].state.report[52] & 0x10) != 0;
+            out->is_charging = (win32_gamepad_ctx.ds_devices[index].state.report[52] & 0x10) != 0;
             return TRUE;
         }
     }
     
     // For other HID devices
     if (index >= 0 && index < PAL_MAX_GAMEPADS && 
-        win32_gamepad_ctx.win32_raw_devices[index].connected) {
+        win32_gamepad_ctx.hid_devices[index].connected) {
         // Generic HID battery query would go here
         // This requires HID usage page 0x84 (Power Device)
     }
@@ -2393,35 +2785,16 @@ pal_bool platform_gamepad_get_battery_info(int index, pal_gamepad_state* out) {
 }
 
 // LED control for DualSense
-pal_bool platform_gamepad_set_led(int index, uint8_t r, uint8_t g, uint8_t b) {
-    if (index < 0 || index >= PAL_MAX_GAMEPADS || 
-        !win32_gamepad_ctx.win32_dualsense_devices[index].connected) {
-        return FALSE;
-    }
-
-    HANDLE handle = win32_gamepad_ctx.win32_dualsense_devices[index].handle;
-    
-    uint8_t output_report[48] = {0};
-    output_report[0] = DS_OUTPUT_REPORT_ID;
-    output_report[1] = 0xFF; // Flags
-    output_report[44] = r;
-    output_report[45] = g;
-    output_report[46] = b;
-
-    DWORD bytesWritten;
-    return WriteFile(handle, output_report, sizeof(output_report), &bytesWritten, NULL) && 
-           bytesWritten == sizeof(output_report);
-}
 
 // Touchpad support for DualSense
 pal_bool platform_gamepad_get_touchpad(int index, pal_gamepad_state* out) {
     if (!out || index < 0 || index >= PAL_MAX_GAMEPADS || 
-        !win32_gamepad_ctx.win32_dualsense_devices[index].connected ||
-        !win32_gamepad_ctx.win32_dualsense_devices[index].state.has_report) {
+        !win32_gamepad_ctx.ds_devices[index].connected ||
+        !win32_gamepad_ctx.ds_devices[index].state.has_report) {
         return FALSE;
     }
 
-    uint8_t* report = win32_gamepad_ctx.win32_dualsense_devices[index].state.report;
+    uint8_t* report = win32_gamepad_ctx.ds_devices[index].state.report;
     out->touchpad.touch_count = report[35] & 0x03;
     
     for (int i = 0; i < out->touchpad.touch_count; i++) {
@@ -2438,12 +2811,12 @@ pal_bool platform_gamepad_get_touchpad(int index, pal_gamepad_state* out) {
 // Motion sensors for DualSense
 pal_bool platform_gamepad_get_motion(int index, pal_gamepad_state* out) {
     if (!out || index < 0 || index >= PAL_MAX_GAMEPADS || 
-        !win32_gamepad_ctx.win32_dualsense_devices[index].connected ||
-        !win32_gamepad_ctx.win32_dualsense_devices[index].state.has_report) {
+        !win32_gamepad_ctx.ds_devices[index].connected ||
+        !win32_gamepad_ctx.ds_devices[index].state.has_report) {
         return FALSE;
     }
 
-    uint8_t* report = win32_gamepad_ctx.win32_dualsense_devices[index].state.report;
+    uint8_t* report = win32_gamepad_ctx.ds_devices[index].state.report;
     
     // Accelerometer (in G's)
     out->accel_x = (int16_t)(report[16] << 8 | report[15]) / 8192.0f;
@@ -2459,42 +2832,22 @@ pal_bool platform_gamepad_get_motion(int index, pal_gamepad_state* out) {
 }
 
 void platform_gamepad_shutdown() {
-    if (!win32_gamepad_ctx.win32_initialized) return;
+    if (!win32_gamepad_ctx.initialized) return;
     
     for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
-        if (win32_gamepad_ctx.win32_dualsense_devices[i].connected) {
-            CancelIo(win32_gamepad_ctx.win32_dualsense_devices[i].handle);
-            if (win32_gamepad_ctx.win32_dualsense_devices[i].state.overlapped.hEvent) {
-                CloseHandle(win32_gamepad_ctx.win32_dualsense_devices[i].state.overlapped.hEvent);
+        if (win32_gamepad_ctx.ds_devices[i].connected) {
+            CancelIo(win32_gamepad_ctx.ds_devices[i].handle);
+            if (win32_gamepad_ctx.ds_devices[i].state.overlapped.hEvent) {
+                CloseHandle(win32_gamepad_ctx.ds_devices[i].state.overlapped.hEvent);
             }
-            CloseHandle(win32_gamepad_ctx.win32_dualsense_devices[i].handle);
-            win32_gamepad_ctx.win32_dualsense_devices[i].connected = FALSE;
+            CloseHandle(win32_gamepad_ctx.ds_devices[i].handle);
+            win32_gamepad_ctx.ds_devices[i].connected = FALSE;
         }
     }
 
-    win32_gamepad_ctx.win32_initialized = FALSE;
+    win32_gamepad_ctx.initialized = FALSE;
 }
 
-pal_bool platform_gamepad_set_vibration(int index, float left_motor, float right_motor) {
-#if PAL_XINPUT_ENABLED
-    if (index < 4 && win32_gamepad_ctx.win32_xinput_connected[index]) {
-        XINPUT_VIBRATION vib = {
-            .wLeftMotorSpeed = (WORD)(left_motor * 65535),
-            .wRightMotorSpeed = (WORD)(right_motor * 65535)
-        };
-        return XInputSetState(index, &vib) == ERROR_SUCCESS;
-    }
-    index -= 4;
-#endif
-
-    // DualSense vibration
-    if (index >= 0 && index < PAL_MAX_GAMEPADS && 
-        win32_gamepad_ctx.win32_dualsense_devices[index].connected) {
-        return win32_dualsense_set_vibration(index, left_motor, right_motor);
-    }
-    
-    return FALSE;
-}
 int platform_sleep(double milliseconds) {
     static int initialized = 0;
     static TIMECAPS tc;
