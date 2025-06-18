@@ -176,7 +176,13 @@ typedef struct {
     uint32_t dwImageOffset; // Offset to PNG data (after header)
 } ICONDIRENTRY;
 #pragma pack(pop)
+
 static LRESULT CALLBACK win32_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static void win32_handle_ds_connection(HANDLE hDevice);
+static void win32_dualsense_to_unified(int index, pal_gamepad_state* out);
+static void win32_update_ds_state(int index);
+static void win32_start_dualsense_async_read(int index);
+
 pal_bool platform_make_window_fullscreen(pal_window* window) {
     window->windowedStyle = GetWindowLongA(window->hwnd, GWL_STYLE);
     GetWindowRect(window->hwnd, &window->windowedRect);
@@ -1573,10 +1579,10 @@ pal_bool platform_gamepad_load_mappings(const char* filename);
 #define DUALSHOCK_PRODUCT_ID  0x0CE6
 #define DS4_V1_PRODUCT_ID     0x05C4
 #define DS4_V2_PRODUCT_ID     0x09CC
-#define DS_INPUT_REPORT_ID    0x01
-#define DS_OUTPUT_REPORT_ID   0x31
-#define DS_FEATURE_REPORT_ID  0x05
-#define DS_BT_REPORT_ID       0x31
+#define DS4_USB_REPORT_ID     0x01    // USB input reports
+#define DS4_BT_INPUT_REPORT_ID 0x11   // Bluetooth input reports
+#define DS4_BT_OUTPUT_REPORT_ID 0x31  // Bluetooth output reports (rumble/LEDs)
+#define DS4_FEATURE_REPORT_ID 0x05    // Feature reports
 
 // Button masks
 #define DS_BUTTON_MASK_SQUARE     0x10
@@ -1601,24 +1607,6 @@ static pal_bool win32_is_xbox_controller(uint16_t vid, uint16_t pid) {
 
 static pal_bool win32_is_dualsense(uint16_t vid, uint16_t pid) {
     return (vid == DUALSHOCK_VENDOR_ID && pid == DUALSHOCK_PRODUCT_ID);
-}
-
-static void win32_start_dualsense_async_read(int index) {
-    if (!win32_gamepad_ctx.ds_devices[index].connected) return;
-
-    HANDLE hDevice = win32_gamepad_ctx.ds_devices[index].handle;
-    win32_dualsense_state* state = &win32_gamepad_ctx.ds_devices[index].state;
-    
-    memset(state->report, 0, sizeof(state->report));
-    ResetEvent(state->overlapped.hEvent);
-    
-    if (!ReadFile(hDevice, state->report, sizeof(state->report), NULL, &state->overlapped)) {
-        if (GetLastError() != ERROR_IO_PENDING) {
-            win32_gamepad_ctx.ds_devices[index].connected = FALSE;
-            CloseHandle(hDevice);
-            CloseHandle(state->overlapped.hEvent);
-        }
-    }
 }
 
 static void win32_init_hid_device_buttons(struct hid_device* device, PHIDP_PREPARSED_DATA pp_data, HIDP_CAPS* caps) {
@@ -1708,153 +1696,13 @@ static void win32_update_hid_device(int index) {
     }
 }
 
-// Handle DualSense connection
-static void win32_handle_ds_connection(HANDLE hDevice) {
-    UINT path_length = 0;
-    if (GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, NULL, &path_length) == (UINT)-1) {
-        return;
-    }
-
-    char* device_path = (char*)malloc(path_length);
-    if (!device_path) return;
-
-    if (GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, device_path, &path_length) == (UINT)-1) {
-        free(device_path);
-        return;
-    }
-
-    // Find empty slot
-    for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
-        if (!win32_gamepad_ctx.ds_devices[i].connected) {
-            HANDLE hDualSense = CreateFileA(
-                device_path,
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                NULL,
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
-                NULL);
-
-            if (hDualSense != INVALID_HANDLE_VALUE) {
-                // Get device info
-                RID_DEVICE_INFO info = {0};
-                info.cbSize = sizeof(info);
-                UINT info_size = sizeof(info);
-                GetRawInputDeviceInfo(hDevice, RIDI_DEVICEINFO, &info, &info_size);
-
-                // Initialize device
-                win32_gamepad_ctx.ds_devices[i].handle = hDualSense;
-                win32_gamepad_ctx.ds_devices[i].vendor_id = info.hid.dwVendorId;
-                win32_gamepad_ctx.ds_devices[i].product_id = info.hid.dwProductId;
-                
-                // Get device name
-                wchar_t wname[128] = {0};
-                if (HidD_GetProductString(hDualSense, wname, sizeof(wname))) {
-                    WideCharToMultiByte(CP_UTF8, 0, wname, -1, 
-                                       win32_gamepad_ctx.ds_devices[i].name, 
-                                       sizeof(win32_gamepad_ctx.ds_devices[i].name), 
-                                       NULL, NULL);
-                } else {
-                    strncpy(win32_gamepad_ctx.ds_devices[i].name, "DualSense Controller",
-                           sizeof(win32_gamepad_ctx.ds_devices[i].name) - 1);
-                }
-
-                // Initialize overlapped I/O
-                memset(&win32_gamepad_ctx.ds_devices[i].state, 0, sizeof(win32_dualsense_state));
-                win32_gamepad_ctx.ds_devices[i].state.overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-                win32_gamepad_ctx.ds_devices[i].connected = TRUE;
-                
-                // Start async read
-                win32_start_dualsense_async_read(i);
-                break;
-            }
-        }
-    }
-
-    free(device_path);
-}
-
-// Update DualSense state
-static void win32_update_ds_state(int index) {
-    if (index < 0 || index >= PAL_MAX_GAMEPADS || !win32_gamepad_ctx.ds_devices[index].connected) {
-        return;
-    }
-
-    win32_dualsense_state* state = &win32_gamepad_ctx.ds_devices[index].state;
-    
-    DWORD bytesRead;
-    if (GetOverlappedResult(win32_gamepad_ctx.ds_devices[index].handle, 
-                          &state->overlapped, &bytesRead, FALSE)) {
-        if (bytesRead > 0) {
-            state->has_report = TRUE;
-            state->report_size = bytesRead;
-            win32_start_dualsense_async_read(index);
-        }
-    } else if (GetLastError() != ERROR_IO_INCOMPLETE) {
-        win32_gamepad_ctx.ds_devices[index].connected = FALSE;
-        CloseHandle(win32_gamepad_ctx.ds_devices[index].handle);
-        CloseHandle(state->overlapped.hEvent);
-    }
-}
-
-// Set vibration for all supported controllers
-pal_bool platform_gamepad_set_vibration(int index, float left_motor, float right_motor) {
-    // Clamp values
-    left_motor = fmaxf(0.0f, fminf(1.0f, left_motor));
-    right_motor = fmaxf(0.0f, fminf(1.0f, right_motor));
-
-    // 1. XInput controllers
-#if PAL_XINPUT_ENABLED
-    if (index < 4) {
-        XINPUT_VIBRATION vibration = {
-            .wLeftMotorSpeed = (WORD)(left_motor * 65535.0f),
-            .wRightMotorSpeed = (WORD)(right_motor * 65535.0f)
-        };
-        return XInputSetState(index, &vibration) == ERROR_SUCCESS;
-    }
-    index -= 4;
-#endif
-
-    // 2. DualSense/DS4 controllers
-    if (index >= 0 && index < PAL_MAX_GAMEPADS && 
-        win32_gamepad_ctx.ds_devices[index].connected) {
-        uint8_t report[48] = {0};
-        report[0] = DS_OUTPUT_REPORT_ID;
-        report[1] = 0xFF; // Flags
-        
-        // Motor values (0-255)
-        report[3] = (uint8_t)(right_motor * 255.0f);
-        report[4] = (uint8_t)(left_motor * 255.0f);
-        
-        DWORD bytesWritten;
-        return WriteFile(win32_gamepad_ctx.ds_devices[index].handle, 
-                        report, sizeof(report), &bytesWritten, NULL);
-    }
-
-    // 3. Generic HID devices
-    if (index >= 0 && index < PAL_MAX_GAMEPADS && 
-        win32_gamepad_ctx.hid_devices[index].connected) {
-        // Try to find rumble feature report
-        uint8_t report[64] = {0};
-        
-        // Common HID rumble pattern (may need adjustment per device)
-        report[0] = 0x03; // Feature report ID (common for rumble)
-        report[1] = (uint8_t)(left_motor * 255.0f);
-        report[2] = (uint8_t)(right_motor * 255.0f);
-        
-        return HidD_SetFeature(win32_gamepad_ctx.hid_devices[index].handle, report, sizeof(report));
-    }
-
-    return FALSE;
-}
-
 // Set LED color (for supported controllers)
 pal_bool platform_gamepad_set_led(int index, uint8_t r, uint8_t g, uint8_t b) {
     // 1. DualSense/DS4 controllers
     if (index >= 0 && index < PAL_MAX_GAMEPADS && 
         win32_gamepad_ctx.ds_devices[index].connected) {
         uint8_t report[48] = {0};
-        report[0] = DS_OUTPUT_REPORT_ID;
+        report[0] = DS4_BT_OUTPUT_REPORT_ID;
         report[1] = 0xFF; // Flags
         
         // LED color (offset may vary between DS4 and DualSense)
@@ -1894,7 +1742,7 @@ static void win32_update_dualsense(int index) {
     DWORD bytesRead;
     if (GetOverlappedResult(win32_gamepad_ctx.ds_devices[index].handle, 
                           &state->overlapped, &bytesRead, FALSE)) {
-        if (bytesRead > 0 && state->report[0] == DS_INPUT_REPORT_ID) {
+        if (bytesRead > 0 && state->report[0] == DS4_BT_INPUT_REPORT_ID) {
             state->has_report = TRUE;
             win32_start_dualsense_async_read(index);
         }
@@ -1987,7 +1835,7 @@ static pal_bool win32_dualsense_set_vibration(int index, float left_motor, float
     HANDLE handle = win32_gamepad_ctx.ds_devices[index].handle;
     
     uint8_t output_report[48] = {0};
-    output_report[0] = DS_OUTPUT_REPORT_ID;
+    output_report[0] = DS4_BT_OUTPUT_REPORT_ID;
     output_report[1] = 0xFF; // Flags
     output_report[3] = (uint8_t)(right_motor * 255);
     output_report[4] = (uint8_t)(left_motor * 255);
@@ -2381,57 +2229,126 @@ pal_bool platform_gamepad_get_state(int index, pal_gamepad_state* out_state) {
         
         if (win32_gamepad_ctx.ds_devices[index].state.has_report) {
             uint8_t* report = win32_gamepad_ctx.ds_devices[index].state.report;
+            uint16_t product_id = win32_gamepad_ctx.ds_devices[index].product_id;
             pal_bool is_bluetooth = (win32_gamepad_ctx.ds_devices[index].state.report_size > 64);
+            int data_offset = 0;
 
-            // Skip Bluetooth header if present
-            if (is_bluetooth && report[0] == DS_BT_REPORT_ID) {
-                report++;
-            }
+            // Handle DS4 Bluetooth header
+            if (product_id == DS4_V1_PRODUCT_ID || product_id == DS4_V2_PRODUCT_ID) {
+                if (is_bluetooth) {
+                    if (report[0] == DS4_BT_INPUT_REPORT_ID) { // 0x11
+                        data_offset = 2; // Skip report ID (0x11) and flags byte (0x80/0xC0)
+                    } else {
+                        return FALSE; // Invalid BT report
+                    }
+                }
+                
+                // Buttons (different mapping for DS4)
+                out_state->buttons.a = (report[data_offset + 5] & 0x40) != 0;  // Cross
+                out_state->buttons.b = (report[data_offset + 5] & 0x20) != 0;  // Circle
+                out_state->buttons.x = (report[data_offset + 5] & 0x10) != 0;  // Square
+                out_state->buttons.y = (report[data_offset + 5] & 0x80) != 0;  // Triangle
+                
+                out_state->buttons.left_shoulder = (report[data_offset + 5] & 0x01) != 0;  // L1
+                out_state->buttons.right_shoulder = (report[data_offset + 5] & 0x02) != 0; // R1
+                out_state->buttons.back = (report[data_offset + 6] & 0x10) != 0;           // Share
+                out_state->buttons.start = (report[data_offset + 6] & 0x20) != 0;          // Options
+                out_state->buttons.left_stick = (report[data_offset + 6] & 0x40) != 0;     // L3
+                out_state->buttons.right_stick = (report[data_offset + 6] & 0x80) != 0;    // R3
+                out_state->buttons.guide = (report[data_offset + 7] & 0x01) != 0;          // PS button
+                out_state->buttons.touchpad_button = (report[data_offset + 7] & 0x02) != 0;// Touchpad click
 
-            if (report[0] == DS_INPUT_REPORT_ID) {
-                // Buttons (byte 5-9)
-                out_state->buttons.a = (report[7] & DS_BUTTON_MASK_CROSS) != 0;
-                out_state->buttons.b = (report[7] & DS_BUTTON_MASK_CIRCLE) != 0;
-                out_state->buttons.x = (report[7] & DS_BUTTON_MASK_SQUARE) != 0;
-                out_state->buttons.y = (report[7] & DS_BUTTON_MASK_TRIANGLE) != 0;
-                out_state->buttons.left_shoulder = (report[7] & DS_BUTTON_MASK_L1) != 0;
-                out_state->buttons.right_shoulder = (report[7] & DS_BUTTON_MASK_R1) != 0;
-                out_state->buttons.back = (report[8] & DS_BUTTON_MASK_SHARE) != 0;
-                out_state->buttons.start = (report[8] & DS_BUTTON_MASK_OPTIONS) != 0;
-                out_state->buttons.left_stick = (report[8] & DS_BUTTON_MASK_L3) != 0;
-                out_state->buttons.right_stick = (report[8] & DS_BUTTON_MASK_R3) != 0;
-                out_state->buttons.guide = (report[9] & DS_BUTTON_MASK_PS) != 0;
-                out_state->buttons.touchpad_button = (report[9] & DS_BUTTON_MASK_TOUCHPAD) != 0;
-
-                // D-pad (nibble in byte 5)
-                uint8_t dpad = report[5] & 0x0F;
+                // D-pad
+                uint8_t dpad = report[data_offset + 5] & 0x0F;
                 out_state->buttons.dpad_up = (dpad == 7 || dpad == 0 || dpad == 1);
                 out_state->buttons.dpad_right = (dpad == 1 || dpad == 2 || dpad == 3);
                 out_state->buttons.dpad_down = (dpad == 3 || dpad == 4 || dpad == 5);
                 out_state->buttons.dpad_left = (dpad == 5 || dpad == 6 || dpad == 7);
 
-                // Analog sticks (-1.0 to 1.0)
-                out_state->axes.left_x = (report[1] - 127) / 127.0f;
-                out_state->axes.left_y = (report[2] - 127) / 127.0f;
-                out_state->axes.right_x = (report[3] - 127) / 127.0f;
-                out_state->axes.right_y = (report[4] - 127) / 127.0f;
+                // Analog sticks
+                out_state->axes.left_x = (report[data_offset + 1] - 127) / 127.0f;
+                out_state->axes.left_y = (report[data_offset + 2] - 127) / 127.0f;
+                out_state->axes.right_x = (report[data_offset + 3] - 127) / 127.0f;
+                out_state->axes.right_y = (report[data_offset + 4] - 127) / 127.0f;
 
-                // Triggers (0.0 to 1.0)
-                out_state->axes.left_trigger = report[5] / 255.0f;
-                out_state->axes.right_trigger = report[6] / 255.0f;
+                // Triggers
+                out_state->axes.left_trigger = report[data_offset + 8] / 255.0f;
+                out_state->axes.right_trigger = report[data_offset + 9] / 255.0f;
 
                 // Metadata
-                strncpy(out_state->name, win32_gamepad_ctx.ds_devices[index].name, 
-                       sizeof(out_state->name));
-                out_state->vendor_id = win32_gamepad_ctx.ds_devices[index].vendor_id;
-                out_state->product_id = win32_gamepad_ctx.ds_devices[index].product_id;
+                strncpy(out_state->name, "DualShock 4 Controller", sizeof(out_state->name));
+                out_state->vendor_id = DUALSHOCK_VENDOR_ID;
+                out_state->product_id = product_id;
                 out_state->connected = TRUE;
                 out_state->is_xinput = FALSE;
                 return TRUE;
+            } else {
+                if (report[0] == DS4_BT_INPUT_REPORT_ID) {
+                    // DualSense USB report parsing
+                    out_state->buttons.a = (report[7] & DS_BUTTON_MASK_CROSS) != 0;
+                    out_state->buttons.b = (report[7] & DS_BUTTON_MASK_CIRCLE) != 0;
+                    out_state->buttons.x = (report[7] & DS_BUTTON_MASK_SQUARE) != 0;
+                    out_state->buttons.y = (report[7] & DS_BUTTON_MASK_TRIANGLE) != 0;
+                    out_state->buttons.left_shoulder = (report[7] & DS_BUTTON_MASK_L1) != 0;
+                    out_state->buttons.right_shoulder = (report[7] & DS_BUTTON_MASK_R1) != 0;
+                    out_state->buttons.back = (report[8] & DS_BUTTON_MASK_SHARE) != 0;
+                    out_state->buttons.start = (report[8] & DS_BUTTON_MASK_OPTIONS) != 0;
+                    out_state->buttons.left_stick = (report[8] & DS_BUTTON_MASK_L3) != 0;
+                    out_state->buttons.right_stick = (report[8] & DS_BUTTON_MASK_R3) != 0;
+                    out_state->buttons.guide = (report[9] & DS_BUTTON_MASK_PS) != 0;
+                    out_state->buttons.touchpad_button = (report[9] & DS_BUTTON_MASK_TOUCHPAD) != 0;
+
+                    // D-pad (nibble in byte 5)
+                    uint8_t dpad = report[5] & 0x0F;
+                    out_state->buttons.dpad_up = (dpad == 7 || dpad == 0 || dpad == 1);
+                    out_state->buttons.dpad_right = (dpad == 1 || dpad == 2 || dpad == 3);
+                    out_state->buttons.dpad_down = (dpad == 3 || dpad == 4 || dpad == 5);
+                    out_state->buttons.dpad_left = (dpad == 5 || dpad == 6 || dpad == 7);
+
+                    // Analog sticks (-1.0 to 1.0)
+                    out_state->axes.left_x = (report[1] - 127) / 127.0f;
+                    out_state->axes.left_y = (report[2] - 127) / 127.0f;
+                    out_state->axes.right_x = (report[3] - 127) / 127.0f;
+                    out_state->axes.right_y = (report[4] - 127) / 127.0f;
+
+                    // Triggers (0.0 to 1.0)
+                    out_state->axes.left_trigger = report[5] / 255.0f;
+                    out_state->axes.right_trigger = report[6] / 255.0f;
+
+                    // Battery (0-10 scale in report[52])
+                    uint8_t battery = report[52] & 0x0F;
+                    out_state->battery_level = (float)battery / 10.0f;
+                    out_state->is_charging = (report[52] & 0x10) != 0;
+
+                    // Motion sensors
+                    out_state->accel_x = (int16_t)(report[16] << 8 | report[15]) / 8192.0f;
+                    out_state->accel_y = (int16_t)(report[18] << 8 | report[17]) / 8192.0f;
+                    out_state->accel_z = (int16_t)(report[20] << 8 | report[19]) / 8192.0f;
+                    out_state->gyro_x = (int16_t)(report[22] << 8 | report[21]) / 1024.0f;
+                    out_state->gyro_y = (int16_t)(report[24] << 8 | report[23]) / 1024.0f;
+                    out_state->gyro_z = (int16_t)(report[26] << 8 | report[25]) / 1024.0f;
+
+                    // Touchpad
+                    out_state->touchpad.touch_count = report[35] & 0x03;
+                    for (int i = 0; i < out_state->touchpad.touch_count && i < PAL_MAX_TOUCHES; i++) {
+                        int offset = 36 + (i * 9);
+                        out_state->touchpad.touches[i].id = report[offset] & 0x7F;
+                        out_state->touchpad.touches[i].x = ((report[offset + 2] & 0x0F) << 8 | report[offset + 1]);
+                        out_state->touchpad.touches[i].y = (report[offset + 3] << 4 | ((report[offset + 2] & 0xF0) >> 4));
+                        out_state->touchpad.touches[i].down = !(report[offset] & 0x80);
+                    }
+
+                    // Metadata
+                    strncpy(out_state->name, "DualSense Controller", sizeof(out_state->name));
+                    out_state->vendor_id = DUALSHOCK_VENDOR_ID;
+                    out_state->product_id = DUALSHOCK_PRODUCT_ID;
+                    out_state->connected = TRUE;
+                    out_state->is_xinput = FALSE;
+                    return TRUE;
+                }
             }
         }
     }
-
     // 3. Handle generic HID devices
     if (index >= 0 && index < PAL_MAX_GAMEPADS && 
         win32_gamepad_ctx.hid_devices[index].connected) {
@@ -2902,5 +2819,179 @@ int platform_sleep(double milliseconds) {
     }
 
     return 0; // Success
+}
+
+static void win32_handle_ds_connection(HANDLE hDevice) {
+    UINT path_length = 0;
+    if (GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, NULL, &path_length) == (UINT)-1) {
+        return;
+    }
+
+    char* device_path = (char*)malloc(path_length);
+    if (!device_path) return;
+
+    if (GetRawInputDeviceInfo(hDevice, RIDI_DEVICENAME, device_path, &path_length) == (UINT)-1) {
+        free(device_path);
+        return;
+    }
+
+    for (int i = 0; i < PAL_MAX_GAMEPADS; i++) {
+        if (!win32_gamepad_ctx.ds_devices[i].connected) {
+            HANDLE hDualSense = CreateFileA(
+                device_path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED,
+                NULL);
+
+            if (hDualSense != INVALID_HANDLE_VALUE) {
+                // Get device info
+                RID_DEVICE_INFO info = {0};
+                info.cbSize = sizeof(info);
+                UINT info_size = sizeof(info);
+                GetRawInputDeviceInfo(hDevice, RIDI_DEVICEINFO, &info, &info_size);
+
+                // Initialize device
+                win32_gamepad_ctx.ds_devices[i].handle = hDualSense;
+                win32_gamepad_ctx.ds_devices[i].vendor_id = info.hid.dwVendorId;
+                win32_gamepad_ctx.ds_devices[i].product_id = info.hid.dwProductId;
+                
+                // Get device name
+                wchar_t wname[128] = {0};
+                if (HidD_GetProductString(hDualSense, wname, sizeof(wname))) {
+                    WideCharToMultiByte(CP_UTF8, 0, wname, -1, 
+                                       win32_gamepad_ctx.ds_devices[i].name, 
+                                       sizeof(win32_gamepad_ctx.ds_devices[i].name), 
+                                       NULL, NULL);
+                } else {
+                    strncpy(win32_gamepad_ctx.ds_devices[i].name, "DualShock 4 Controller",
+                           sizeof(win32_gamepad_ctx.ds_devices[i].name) - 1);
+                }
+
+                // Initialize overlapped I/O
+                memset(&win32_gamepad_ctx.ds_devices[i].state, 0, sizeof(win32_dualsense_state));
+                win32_gamepad_ctx.ds_devices[i].state.overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+                win32_gamepad_ctx.ds_devices[i].connected = TRUE;
+                
+                // Start async read
+                win32_start_dualsense_async_read(i);
+                break;
+            }
+        }
+    }
+
+    free(device_path);
+}
+
+static void win32_start_dualsense_async_read(int index) {
+    if (!win32_gamepad_ctx.ds_devices[index].connected) return;
+
+    HANDLE hDevice = win32_gamepad_ctx.ds_devices[index].handle;
+    win32_dualsense_state* state = &win32_gamepad_ctx.ds_devices[index].state;
+    
+    // Special initialization for DS4
+    if (win32_gamepad_ctx.ds_devices[index].product_id == DS4_V1_PRODUCT_ID || 
+        win32_gamepad_ctx.ds_devices[index].product_id == DS4_V2_PRODUCT_ID) {
+        uint8_t feature_report[32] = {0};
+        feature_report[0] = DS4_FEATURE_REPORT_ID;
+        if (!HidD_SetFeature(hDevice, feature_report, sizeof(feature_report))) {
+            printf("Failed to set DS4 feature report\n");
+        }
+    }
+
+    memset(state->report, 0, sizeof(state->report));
+    ResetEvent(state->overlapped.hEvent);
+    
+    if (!ReadFile(hDevice, state->report, sizeof(state->report), NULL, &state->overlapped)) {
+        if (GetLastError() != ERROR_IO_PENDING) {
+            win32_gamepad_ctx.ds_devices[index].connected = FALSE;
+            CloseHandle(hDevice);
+            CloseHandle(state->overlapped.hEvent);
+        }
+    }
+}
+
+static void win32_update_ds_state(int index) {
+    if (index < 0 || index >= PAL_MAX_GAMEPADS || !win32_gamepad_ctx.ds_devices[index].connected) {
+        return;
+    }
+
+    win32_dualsense_state* state = &win32_gamepad_ctx.ds_devices[index].state;
+    
+    DWORD bytesRead;
+    if (GetOverlappedResult(win32_gamepad_ctx.ds_devices[index].handle, 
+                          &state->overlapped, &bytesRead, FALSE)) {
+        if (bytesRead > 0) {
+            pal_bool is_valid = FALSE;
+            uint16_t product_id = win32_gamepad_ctx.ds_devices[index].product_id;
+            
+            if (product_id == DS4_V1_PRODUCT_ID || product_id == DS4_V2_PRODUCT_ID) {
+                // DS4 validation
+                is_valid = (state->report[0] == DS4_USB_REPORT_ID) || 
+                          (bytesRead > 64 && state->report[0] == DS4_BT_INPUT_REPORT_ID);
+            } else {
+                // DualSense validation
+                is_valid = (state->report[0] == DS4_BT_INPUT_REPORT_ID);
+            }
+            
+            if (is_valid) {
+                state->has_report = TRUE;
+                state->report_size = bytesRead;
+                win32_start_dualsense_async_read(index);
+            }
+        }
+    } else if (GetLastError() != ERROR_IO_INCOMPLETE) {
+        win32_gamepad_ctx.ds_devices[index].connected = FALSE;
+        CloseHandle(win32_gamepad_ctx.ds_devices[index].handle);
+        CloseHandle(state->overlapped.hEvent);
+    }
+}
+
+pal_bool platform_gamepad_set_vibration(int index, float left_motor, float right_motor) {
+    // Clamp values
+    left_motor = fmaxf(0.0f, fminf(1.0f, left_motor));
+    right_motor = fmaxf(0.0f, fminf(1.0f, right_motor));
+
+    // 1. XInput controllers
+#if PAL_XINPUT_ENABLED
+    if (index < 4) {
+        XINPUT_VIBRATION vibration = {
+            .wLeftMotorSpeed = (WORD)(left_motor * 65535.0f),
+            .wRightMotorSpeed = (WORD)(right_motor * 65535.0f)
+        };
+        return XInputSetState(index, &vibration) == ERROR_SUCCESS;
+    }
+    index -= 4;
+#endif
+
+    // 2. DualSense/DS4 controllers
+    if (index >= 0 && index < PAL_MAX_GAMEPADS && 
+        win32_gamepad_ctx.ds_devices[index].connected) {
+        
+        uint8_t report[78] = {0};
+        pal_bool is_bluetooth = (win32_gamepad_ctx.ds_devices[index].state.report_size > 64);
+        
+        if (is_bluetooth) {
+            // Bluetooth output report
+            report[0] = DS4_BT_OUTPUT_REPORT_ID;  // 0x31
+            report[1] = 0x80;  // Flags
+            report[4] = (uint8_t)(right_motor * 255.0f);  // Fast motor
+            report[5] = (uint8_t)(left_motor * 255.0f);   // Slow motor
+        } else {
+            // USB output report
+            report[0] = DS4_FEATURE_REPORT_ID;  // 0x05
+            report[1] = 0x01;  // Enable rumble
+            report[4] = (uint8_t)(right_motor * 255.0f);  // Fast motor
+            report[5] = (uint8_t)(left_motor * 255.0f);   // Slow motor
+        }
+        
+        DWORD bytesWritten;
+        return WriteFile(win32_gamepad_ctx.ds_devices[index].handle, 
+                        report, sizeof(report), &bytesWritten, NULL);
+    }
+
+    return FALSE;
 }
 #endif // WIN32_PLATFORM_H
